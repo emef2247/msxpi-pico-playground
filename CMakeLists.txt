@@ -25,6 +25,7 @@ target_link_libraries(msx_bus_logger
     pico_stdlib
     hardware_timer
     hardware_pio
+    hardware_dma
 )
 
 pico_enable_stdio_usb(msx_bus_logger 1)

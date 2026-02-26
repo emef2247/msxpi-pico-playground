@@ -2,6 +2,8 @@
 #include "pico/stdlib.h"
 #include "hardware/timer.h"
 #include "hardware/pio.h"
+#include "hardware/dma.h"
+
 #include "msx_rd_logger.pio.h"
 
 /* ===== ピン定義（配線に合わせて変更） ===== */
@@ -36,13 +38,19 @@
 #define PIN_WAIT	28
 #define PIN_RESET	29   // MSX /RESET（読むだけ）
 
+#define LOG_BUF_WORDS 512
+
 /* ===== グローバル変数 ===== */
 PIO pio = pio0;
 uint sm = 0;
 
+uint32_t log_buf[LOG_BUF_WORDS];
+volatile uint32_t log_wr_idx = 0;
+
+int dma_chan;
+dma_channel_config dma_cfg;
 
 /* ===== ユーティリティ ===== */
-
 static inline uint32_t now_us(void) {
     return to_us_since_boot(get_absolute_time());
 }
@@ -86,7 +94,7 @@ void init_bus_pins(void) {
     gpio_disable_pulls(PIN_RD);
 }
 
-void init_pio_logger(void) {
+void pio_init_logger	(void) {
     uint offset = pio_add_program(pio, &msx_rd_logger_program);
     pio_sm_config c = msx_rd_logger_program_get_default_config(offset);
 
@@ -113,6 +121,32 @@ void init_pio_logger(void) {
     pio_sm_set_enabled(pio, sm, true);
 }
 
+void dma_init_logger(PIO pio, uint sm) {
+    dma_chan = dma_claim_unused_channel(true);
+    dma_cfg = dma_channel_get_default_config(dma_chan);
+
+    // 転送サイズ：32bit
+    channel_config_set_transfer_data_size(&dma_cfg, DMA_SIZE_32);
+
+    // 書き込み側はインクリメント（RAM）
+    channel_config_set_write_increment(&dma_cfg, true);
+
+    // 読み込み側は固定（PIO RX FIFO）
+    channel_config_set_read_increment(&dma_cfg, false);
+
+    // DREQ: PIO RX FIFO
+    channel_config_set_dreq(&dma_cfg,
+        pio_get_dreq(pio, sm, false)); // false = RX
+
+    dma_channel_configure(
+        dma_chan,
+        &dma_cfg,
+        log_buf,                // write addr
+        &pio->rxf[sm],          // read addr
+        LOG_BUF_WORDS,           // 転送数
+        true                     // start immediately
+    );
+}
 
 /* ===== メイン ===== */
 
@@ -132,31 +166,41 @@ int main(void) {
     }
 
 	/* 4) MSX が起きたので PIO ロガー開始 */
-	init_pio_logger();
+	pio_init_logger();
+	
 
-    /* 5) USB があれば起動メッセージ */
+	/* 5) DMA 起動　(必ず PIO → DMA の順: FIFO が存在してから DMA を張る) */
+	dma_init_logger(pio, sm);
+
+
+    /* 6) USB があれば起動メッセージ */
     if (stdio_usb_connected()) {
         printf("\nMSX bus logger armed\n");
         printf("Logger start @ %u us\n", now_us());
     }
 
-    bool last_active = false;
-
-    /* 6) メインループ */
+	/* 7) メインループ*/
+	uint32_t last_dma_count = LOG_BUF_WORDS;
 	while (1) {
-		if (!pio_sm_is_rx_fifo_empty(pio, sm)) {
-			uint32_t v = pio_sm_get(pio, sm);
+		uint32_t remaining = dma_channel_hw_addr(dma_chan)->transfer_count;
+		uint32_t written = LOG_BUF_WORDS - remaining;
+
+		while (log_wr_idx < written) {
+			uint32_t v = log_buf[log_wr_idx];
 			uint8_t data = v & 0xFF;
 
 			if (stdio_usb_connected()) {
-				printf("IORQ RD data = %02X @ %u us\n",
-					   data, now_us());
+				printf("%u,%02X\n", now_us(), data);
 			}
+
+			log_wr_idx++;
 		}
 
-		if (!msx_power_on()) {
-			enter_safe_state();
-			while (1) sleep_ms(100);
+		/* バッファ満了 → 再スタート */
+		if (remaining == 0) {
+			log_wr_idx = 0;
+			dma_channel_set_read_addr(dma_chan, &pio->rxf[sm], false);
+			dma_channel_set_write_addr(dma_chan, log_buf, true);
 		}
 
 		tight_loop_contents();
