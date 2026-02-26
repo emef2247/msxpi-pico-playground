@@ -7,48 +7,60 @@
 #include "msx_rd_logger.pio.h"
 
 /* ===== ピン定義（配線に合わせて変更） ===== */
-#define PIN_A0  	0	//A0_3V3
-#define PIN_A1  	1
-#define PIN_A2  	2
-#define PIN_A3  	3
-#define PIN_A4  	4
-#define PIN_A5  	5
-#define PIN_A6  	6
-#define PIN_A7  	7
-#define PIN_A8  	8	//A8_3V3
-#define PIN_A9  	9
-#define PIN_A10  	10
-#define PIN_A11  	11
-#define PIN_A12  	12
-#define PIN_A13  	13
-#define PIN_A14  	14
-#define PIN_A15  	15
-#define PIN_D0  	16
-#define PIN_D1  	17
-#define PIN_D2  	18
-#define PIN_D3  	19
-#define PIN_D4  	20
-#define PIN_D5  	21
-#define PIN_D6  	22
-#define PIN_D7  	23
-#define PIN_RD		24
-#define PIN_WR		25
-#define PIN_IORQ	26   // MSX /RESET（読むだけ）
-#define PIN_SLTSL	27   // 
-#define PIN_WAIT	28
-#define PIN_RESET	29   // MSX /RESET（読むだけ）
+#define PIN_A0 0 //A0_3V3 
+#define PIN_A1 1 
+#define PIN_A2 2 
+#define PIN_A3 3 
+#define PIN_A4 4 
+#define PIN_A5 5 
+#define PIN_A6 6 
+#define PIN_A7 7 
+#define PIN_A8 8 //A8_3V3 
+#define PIN_A9 9 
+#define PIN_A10 10 
+#define PIN_A11 11 
+#define PIN_A12 12 
+#define PIN_A13 13 
+#define PIN_A14 14 
+#define PIN_A15 15 
+#define PIN_D0 16 
+#define PIN_D1 17 
+#define PIN_D2 18 
+#define PIN_D3 19 
+#define PIN_D4 20 
+#define PIN_D5 21 
+#define PIN_D6 22 
+#define PIN_D7 23 
+#define PIN_RD 24 
+#define PIN_WR 25 
+#define PIN_IORQ 26 // MSX /RESET（読むだけ） 
+#define PIN_SLTSL 27 // 
+#define PIN_WAIT 28 
+#define PIN_RESET 29 // MSX /RESET（読むだけ）
 
-#define LOG_BUF_WORDS 512
+/* リングバッファ */
+#define DMA_BLOCK_WORDS 32
+#define LOG_ENTRIES (8 * 1024)   // 8K entries
+#define LOG_BUF_MASK (LOG_ENTRIES - 1)
 
 /* ===== グローバル変数 ===== */
 PIO pio = pio0;
 uint sm = 0;
-
-uint32_t log_buf[LOG_BUF_WORDS];
-volatile uint32_t log_wr_idx = 0;
-
 int dma_chan;
 dma_channel_config dma_cfg;
+
+volatile uint32_t dma_write_count = 0;
+uint32_t cpu_read_count = 0;
+
+/* DMA 生ログ（PIO→DMA） */
+uint32_t dma_raw_buf[LOG_ENTRIES];
+
+/* 64bit 完成ログ */
+uint64_t log_buf64[LOG_ENTRIES];
+
+volatile uint32_t dma_wr_idx = 0;
+volatile uint32_t log_wr_idx = 0;
+
 
 /* ===== ユーティリティ ===== */
 static inline uint32_t now_us(void) {
@@ -141,11 +153,95 @@ void dma_init_logger(PIO pio, uint sm) {
     dma_channel_configure(
         dma_chan,
         &dma_cfg,
-        log_buf,                // write addr
+        dma_raw_buf,                // write addr
         &pio->rxf[sm],          // read addr
-        LOG_BUF_WORDS,           // 転送数
+        DMA_BLOCK_WORDS,           // 転送数
         true                     // start immediately
     );
+}
+
+/* DMA ISR */
+void __isr dma_handler(void) {
+    dma_hw->ints0 = 1u << dma_chan;
+    dma_write_count += DMA_BLOCK_WORDS;
+
+    dma_channel_set_read_addr(dma_chan, &pio->rxf[sm], false);
+	dma_channel_set_write_addr(
+		dma_chan,
+		&dma_raw_buf[dma_wr_idx & LOG_BUF_MASK],
+		true
+	);
+}
+
+void dma_init_logger_with_ring_enabled(PIO pio, uint sm) {
+    dma_chan = dma_claim_unused_channel(true);
+    dma_cfg = dma_channel_get_default_config(dma_chan);
+
+	// 転送サイズ：32bit
+    channel_config_set_transfer_data_size(&dma_cfg, DMA_SIZE_32);
+	
+	// DREQ: PIO RX FIFO
+    channel_config_set_dreq(&dma_cfg, pio_get_dreq(pio, sm, false));// false = RX
+	
+	// 読み込み側は固定（PIO RX FIFO）
+    channel_config_set_read_increment(&dma_cfg, false);
+	
+	// 書き込み側はインクリメント（RAM）
+    channel_config_set_write_increment(&dma_cfg, true);
+	
+	// DMA リングバッファ化 (DMAは 一定サイズを永遠に周回)
+    channel_config_set_chain_to(&dma_cfg, dma_chan);
+
+    dma_channel_configure(
+        dma_chan,
+        &dma_cfg,
+        dma_raw_buf,
+        &pio->rxf[sm],
+        DMA_BLOCK_WORDS,
+        false
+    );
+
+    dma_channel_set_irq0_enabled(dma_chan, true);
+    irq_set_exclusive_handler(DMA_IRQ_0, dma_handler);
+    irq_set_enabled(DMA_IRQ_0, true);
+
+    dma_start_channel_mask(1u << dma_chan);
+}
+
+/* 64bit Pack Format */
+/* 63      56 55      48 47      32 31      16 15       8 7        0   */
+/* +----------+----------+----------+----------+----------+----------+ */
+/* |  FLAGS   |  RSV     |   ADDR   |   ADDR   |   DATA   |  TIME_L  | */
+/* +----------+----------+----------+----------+----------+----------+ */
+/* DATA : D0–D7				*/
+/* ADDR : A0–A15（CPU GPIO）	*/
+/* TIME_L : 下位 8bit		*/
+/* FLAGS					*/
+/* 	bit0 RD					*/
+/* 	bit1 WR					*/
+/* 	bit2 IO					*/
+/* 	bit3 EXT_SLOT			*/
+
+/* ADDR（A0–A15）取得関数 */
+static inline uint16_t read_addr_pins(void) {
+    uint16_t addr = 0;
+    for (int i = 0; i < 16; i++) {
+        addr |= (gpio_get(PIN_A0 + i) << i);
+    }
+    return addr;
+}
+
+/* FLAGS 合成関数 */
+static inline uint8_t make_flags(uint32_t pio_v) {
+    uint8_t f = 0;
+
+    if (!(pio_v & (1u << 8)))  f |= 1 << 0; // RD
+    if (!(pio_v & (1u << 9)))  f |= 1 << 1; // WR
+    if (!(pio_v & (1u << 10))) f |= 1 << 2; // IO (/IORQ low)
+
+    if (gpio_get(PIN_SLTSL))   f |= 1 << 3; // EXT SLOT
+
+    return f;
 }
 
 /* ===== メイン ===== */
@@ -170,7 +266,7 @@ int main(void) {
 	
 
 	/* 5) DMA 起動　(必ず PIO → DMA の順: FIFO が存在してから DMA を張る) */
-	dma_init_logger(pio, sm);
+	dma_init_logger_with_ring_enabled(pio, sm);
 
 
     /* 6) USB があれば起動メッセージ */
@@ -180,27 +276,32 @@ int main(void) {
     }
 
 	/* 7) メインループ*/
-	uint32_t last_dma_count = LOG_BUF_WORDS;
 	while (1) {
-		uint32_t remaining = dma_channel_hw_addr(dma_chan)->transfer_count;
-		uint32_t written = LOG_BUF_WORDS - remaining;
+		uint32_t written = dma_write_count;
 
 		while (log_wr_idx < written) {
-			uint32_t v = log_buf[log_wr_idx];
-			uint8_t data = v & 0xFF;
+			uint32_t raw = dma_raw_buf[log_wr_idx & LOG_BUF_MASK];
 
+			uint8_t  data  = raw & 0xFF;
+			uint8_t  flags = make_flags(raw);
+			uint16_t addr  = read_addr_pins();
+			uint8_t  timeL = now_us() & 0xFF;
+
+			uint64_t pack =
+				((uint64_t)flags << 56) |
+				((uint64_t)addr  << 32) |
+				((uint64_t)data  << 16) |
+				((uint64_t)timeL);
+
+			log_buf64[log_wr_idx & LOG_BUF_MASK] = pack;
+
+			/* テキスト確認用（CDC） */
 			if (stdio_usb_connected()) {
-				printf("%u,%02X\n", now_us(), data);
+				printf("%02X,%04X,%02X,%02X\n",
+					   flags, addr, data, timeL);
 			}
 
 			log_wr_idx++;
-		}
-
-		/* バッファ満了 → 再スタート */
-		if (remaining == 0) {
-			log_wr_idx = 0;
-			dma_channel_set_read_addr(dma_chan, &pio->rxf[sm], false);
-			dma_channel_set_write_addr(dma_chan, log_buf, true);
 		}
 
 		tight_loop_contents();

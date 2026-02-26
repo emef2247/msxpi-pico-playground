@@ -14,7 +14,7 @@ add_executable(msx_bus_logger
 )
 
 pico_generate_pio_header(msx_bus_logger
-    ${CMAKE_CURRENT_LIST_DIR}/msx_bus_logger/src/msx_rd_logger.pio
+    ${CMAKE_CURRENT_LIST_DIR}/msx_bus_logger/src/msx_bus_logger.pio
 )
 
 target_include_directories(msx_bus_logger PRIVATE
