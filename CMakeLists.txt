@@ -13,6 +13,10 @@ add_executable(msx_bus_logger
     msx_bus_logger/src/main.c
 )
 
+pico_generate_pio_header(msx_bus_logger
+    ${CMAKE_CURRENT_LIST_DIR}/msx_bus_logger/src/msx_rd_logger.pio
+)
+
 target_include_directories(msx_bus_logger PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
 )
@@ -20,6 +24,7 @@ target_include_directories(msx_bus_logger PRIVATE
 target_link_libraries(msx_bus_logger
     pico_stdlib
     hardware_timer
+    hardware_pio
 )
 
 pico_enable_stdio_usb(msx_bus_logger 1)

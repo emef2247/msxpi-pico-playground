@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "hardware/timer.h"
+#include "hardware/pio.h"
+#include "msx_rd_logger.pio.h"
 
 /* ===== ピン定義（配線に合わせて変更） ===== */
 #define PIN_A0  	0	//A0_3V3
@@ -33,6 +35,11 @@
 #define PIN_SLTSL	27   // 
 #define PIN_WAIT	28
 #define PIN_RESET	29   // MSX /RESET（読むだけ）
+
+/* ===== グローバル変数 ===== */
+PIO pio = pio0;
+uint sm = 0;
+
 
 /* ===== ユーティリティ ===== */
 
@@ -79,6 +86,34 @@ void init_bus_pins(void) {
     gpio_disable_pulls(PIN_RD);
 }
 
+void init_pio_logger(void) {
+    uint offset = pio_add_program(pio, &msx_rd_logger_program);
+    pio_sm_config c = msx_rd_logger_program_get_default_config(offset);
+
+    // データピン D0-D7
+    sm_config_set_in_pins(&c, PIN_D0);
+    sm_config_set_jmp_pin(&c, PIN_IORQ); // /IORQ
+
+    // シフト設定
+    sm_config_set_in_shift(&c,
+        false,   // shift left
+        true,    // autopush
+        8        // 8bit で push
+    );
+
+    // GPIO 初期化
+    for (int i = PIN_D0; i < PIN_IORQ; i++) {
+        pio_gpio_init(pio, i);
+        pio_sm_set_consecutive_pindirs(pio, sm, i, 1, false);
+    }
+    pio_gpio_init(pio, PIN_IORQ);
+    pio_sm_set_consecutive_pindirs(pio, sm, PIN_IORQ, 1, false);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+
 /* ===== メイン ===== */
 
 int main(void) {
@@ -96,8 +131,8 @@ int main(void) {
         tight_loop_contents();   // 低消費＆NOP
     }
 
-    /* 4) MSX が起きたのでバス監視開始 */
-    init_bus_pins();
+	/* 4) MSX が起きたので PIO ロガー開始 */
+	init_pio_logger();
 
     /* 5) USB があれば起動メッセージ */
     if (stdio_usb_connected()) {
@@ -108,30 +143,22 @@ int main(void) {
     bool last_active = false;
 
     /* 6) メインループ */
-    while (1) {
-        bool iorq = !gpio_get(PIN_IORQ);
-        bool rd   = !gpio_get(PIN_RD);
-        bool active = iorq && rd;
+	while (1) {
+		if (!pio_sm_is_rx_fifo_empty(pio, sm)) {
+			uint32_t v = pio_sm_get(pio, sm);
+			uint8_t data = v & 0xFF;
 
-        /* IORQ+RD の立ち上がりを検出 */
-        if (active && !last_active) {
-            if (stdio_usb_connected()) {
-                printf("IORQ+RD @ %u us\n", now_us());
-            }
-        }
-        last_active = active;
+			if (stdio_usb_connected()) {
+				printf("IORQ RD data = %02X @ %u us\n",
+					   data, now_us());
+			}
+		}
 
-        /* MSX 電源断検出 → 即 Hi-Z */
-        if (!msx_power_on()) {
-            if (stdio_usb_connected()) {
-                printf("MSX power lost, entering safe state\n");
-            }
-            enter_safe_state();
-            while (1) {
-                sleep_ms(100);
-            }
-        }
+		if (!msx_power_on()) {
+			enter_safe_state();
+			while (1) sleep_ms(100);
+		}
 
-        tight_loop_contents();
-    }
+		tight_loop_contents();
+	}
 }

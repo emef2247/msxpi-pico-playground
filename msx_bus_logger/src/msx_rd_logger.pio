@@ -1,0 +1,11 @@
+.program msx_rd_logger
+
+; jmp pin = /IORQ (active low)
+; in pins = D0-D7 (8bit)
+
+loop:
+    wait 0 pin 0      ; /IORQ が Low（jmp pin = pin 0）
+    in   pins, 8      ; D0-D7 を一括サンプル
+    push block        ; FIFO へ
+    wait 1 pin 0      ; /IORQ が High に戻るまで待つ
+    jmp  loop
