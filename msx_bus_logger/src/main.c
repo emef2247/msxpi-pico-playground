@@ -61,6 +61,12 @@ uint64_t log_buf64[LOG_ENTRIES];
 volatile uint32_t dma_wr_idx = 0;
 volatile uint32_t log_wr_idx = 0;
 
+/* DROP検出 */
+static bool drop_latched = false;
+static uint8_t drop_seq = 0;
+static bool fifo_overflow = false;
+static bool dma_lag = false;
+static bool dma_lag_prev = false;
 
 /* ===== ユーティリティ ===== */
 static inline uint32_t now_us(void) {
@@ -171,6 +177,19 @@ void __isr dma_handler(void) {
 		&dma_raw_buf[dma_wr_idx & LOG_BUF_MASK],
 		true
 	);
+
+	// DMA 遅延検出（リングバッファ基準）
+	uint32_t pending = dma_write_count - cpu_read_count;
+	bool lag_now = (pending > (LOG_ENTRIES - DMA_BLOCK_WORDS));
+	if (lag_now && !dma_lag_prev) {
+		dma_lag = true;
+		drop_latched = true;
+		drop_seq++;
+	}
+	if (dma_lag) {
+		fifo_overflow = true;   // 今回は同義とする
+	}
+	dma_lag_prev = lag_now;
 }
 
 void dma_init_logger_with_ring_enabled(PIO pio, uint sm) {
@@ -209,18 +228,25 @@ void dma_init_logger_with_ring_enabled(PIO pio, uint sm) {
 }
 
 /* 64bit Pack Format */
-/* 63      56 55      48 47      32 31      16 15       8 7        0   */
-/* +----------+----------+----------+----------+----------+----------+ */
-/* |  FLAGS   |  RSV     |   ADDR   |   ADDR   |   DATA   |  TIME_L  | */
-/* +----------+----------+----------+----------+----------+----------+ */
-/* DATA : D0–D7				*/
-/* ADDR : A0–A15（CPU GPIO）	*/
-/* TIME_L : 下位 8bit		*/
-/* FLAGS					*/
-/* 	bit0 RD					*/
-/* 	bit1 WR					*/
-/* 	bit2 IO					*/
-/* 	bit3 EXT_SLOT			*/
+// 63      56 55      48 47      32 31      16 15       8 7        0   
+// +----------+----------+----------+----------+----------+----------+ 
+// |  FLAGS   |  RSV     |   ADDR   |   ADDR   |   DATA   |  TIME_L  | 
+// +----------+----------+----------+----------+----------+----------+ 
+// DATA : D0–D7				
+// ADDR : A0–A15（CPU GPIO）	
+// TIME_L : 下位 8bit		
+// FLAGS					
+// 	bit0 : RD					
+// 	bit1 : WR					
+// 	bit2 : IO					
+//  bit3 : EXT_SLOT         
+//  bit4 : DROP_LATCHED   ;一度示したら 以後ずっと 1。ログが「完全ではない」ことを示す 大局フラグ。
+//  bit5 : FIFO_OVERFLOW  ;PIO RX FIFO が詰まった兆候。瞬間的な過負荷。				
+//  bit6 : DMA_LAG        ;DMA が CPU/DMA バッファに追いついていない。継続的な帯域不足。
+//  bit7 : RESERVED		  ;これらbit 4,5,6は同時に立つこともある
+// RSV 						
+//  bit0–3 : DROP_SEQ (0–15)  DROP発生回数の下位4bit 
+//  bit4–7 : RESERVED       
 
 /* ADDR（A0–A15）取得関数 */
 static inline uint16_t read_addr_pins(void) {
@@ -234,12 +260,19 @@ static inline uint16_t read_addr_pins(void) {
 /* FLAGS 合成関数 */
 static inline uint8_t make_flags(uint32_t pio_v) {
     uint8_t f = 0;
-
+	
+    /* PIO サンプル由来 */
     if (!(pio_v & (1u << 8)))  f |= 1 << 0; // RD
     if (!(pio_v & (1u << 9)))  f |= 1 << 1; // WR
     if (!(pio_v & (1u << 10))) f |= 1 << 2; // IO (/IORQ low)
 
+    /* GPIO 直読み */
     if (gpio_get(PIN_SLTSL))   f |= 1 << 3; // EXT SLOT
+
+    /* DROP 系（状態フラグ） */
+    if (drop_latched)          f |= 1 << 4; // DROP_LATCHED
+    if (fifo_overflow)         f |= 1 << 5; // FIFO_OVERFLOW
+    if (dma_lag)               f |= 1 << 6; // DMA_LAG
 
     return f;
 }
@@ -281,24 +314,27 @@ int main(void) {
 
 		while (log_wr_idx < written) {
 			uint32_t raw = dma_raw_buf[log_wr_idx & LOG_BUF_MASK];
-
+			cpu_read_count++;
+	
 			uint8_t  data  = raw & 0xFF;
 			uint8_t  flags = make_flags(raw);
 			uint16_t addr  = read_addr_pins();
 			uint8_t  timeL = now_us() & 0xFF;
 
-			uint64_t pack =
-				((uint64_t)flags << 56) |
-				((uint64_t)addr  << 32) |
-				((uint64_t)data  << 16) |
-				((uint64_t)timeL);
+			uint8_t rsv = drop_seq & 0x0F;
+			uint64_t pack = 0;
+			pack |= ((uint64_t)flags << 56);
+			pack |= ((uint64_t)rsv   << 48);
+			pack |= ((uint64_t)addr  << 32);
+			pack |= ((uint64_t)data  << 16);
+			pack |= ((uint64_t)timeL);
 
 			log_buf64[log_wr_idx & LOG_BUF_MASK] = pack;
 
 			/* テキスト確認用（CDC） */
 			if (stdio_usb_connected()) {
-				printf("%02X,%04X,%02X,%02X\n",
-					   flags, addr, data, timeL);
+				printf("%02X,%02X,%04X,%02X,%02X\n",
+					   flags,rsv, addr, data, timeL);
 			}
 
 			log_wr_idx++;
