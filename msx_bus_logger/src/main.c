@@ -186,9 +186,6 @@ void __isr dma_handler(void) {
 		drop_latched = true;
 		drop_seq++;
 	}
-	if (dma_lag) {
-		fifo_overflow = true;   // 今回は同義とする
-	}
 	dma_lag_prev = lag_now;
 }
 
@@ -315,7 +312,8 @@ int main(void) {
 		while (log_wr_idx < written) {
 			uint32_t raw = dma_raw_buf[log_wr_idx & LOG_BUF_MASK];
 			cpu_read_count++;
-	
+			if (dma_lag) fifo_overflow = true;
+			
 			uint8_t  data  = raw & 0xFF;
 			uint8_t  flags = make_flags(raw);
 			uint16_t addr  = read_addr_pins();
