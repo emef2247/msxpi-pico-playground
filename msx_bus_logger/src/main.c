@@ -39,7 +39,7 @@
 #define PIN_RESET 29 // MSX /RESET（読むだけ）
 
 /* リングバッファ */
-#define DMA_BLOCK_WORDS 32
+#define DMA_BLOCK_WORDS 512 // DMA がIRQを出すまでに行うPIO->DMA間の転送回数
 #define LOG_ENTRIES (8 * 1024)   // 8K entries
 #define LOG_BUF_MASK (LOG_ENTRIES - 1)
 
@@ -67,6 +67,9 @@ static uint8_t drop_seq = 0;
 static bool fifo_overflow = false;
 static bool dma_lag = false;
 static bool dma_lag_prev = false;
+
+volatile bool logger_armed = false;
+volatile uint32_t dma_irq_time_us;
 
 /* ===== ユーティリティ ===== */
 static inline uint32_t now_us(void) {
@@ -137,6 +140,11 @@ void pio_init_logger	(void) {
 
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
+	
+	/* DROP 確認用 LED点灯時 DROP有 */
+	gpio_init(PICO_DEFAULT_LED_PIN);
+	gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+	gpio_put(PICO_DEFAULT_LED_PIN, 0); // 初期OFF
 }
 
 void dma_init_logger(PIO pio, uint sm) {
@@ -168,6 +176,7 @@ void dma_init_logger(PIO pio, uint sm) {
 
 /* DMA ISR */
 void __isr dma_handler(void) {
+	dma_irq_time_us = time_us_32();// 32bit wrap（約71分）
     dma_hw->ints0 = 1u << dma_chan;
     dma_write_count += DMA_BLOCK_WORDS;
 
@@ -177,16 +186,16 @@ void __isr dma_handler(void) {
 		&dma_raw_buf[dma_wr_idx & LOG_BUF_MASK],
 		true
 	);
-
+	
+	if (!logger_armed) return;
+	
 	// DMA 遅延検出（リングバッファ基準）
 	uint32_t pending = dma_write_count - cpu_read_count;
-	bool lag_now = (pending > (LOG_ENTRIES - DMA_BLOCK_WORDS));
-	if (lag_now && !dma_lag_prev) {
+	if (pending > LOG_ENTRIES) {
 		dma_lag = true;
 		drop_latched = true;
 		drop_seq++;
 	}
-	dma_lag_prev = lag_now;
 }
 
 void dma_init_logger_with_ring_enabled(PIO pio, uint sm) {
@@ -245,6 +254,18 @@ void dma_init_logger_with_ring_enabled(PIO pio, uint sm) {
 //  bit0–3 : DROP_SEQ (0–15)  DROP発生回数の下位4bit 
 //  bit4–7 : RESERVED       
 
+// Z80 bus
+//   ↓
+// PIO IN + push
+//   ↓
+// PIO RX FIFO (深さ 4)
+//   ↓  (DREQ)
+// DMA
+//   ↓
+// dma_raw_buf[] (RAM ring buffer)
+//   ↓
+// CPU (main loop)
+
 /* ADDR（A0–A15）取得関数 */
 static inline uint16_t read_addr_pins(void) {
     uint16_t addr = 0;
@@ -284,7 +305,7 @@ int main(void) {
 
     /* 2) /RESET は読むだけ（pull しない） */
     gpio_init(PIN_RESET);
-    gpio_set_dir(PIN_RESET, GPIO_IN);
+    gpio_set_dir(PIN_RESET, 0);
 
     /* 3) MSX 電源 ON 待ち */
     while (!msx_power_on()) {
@@ -298,12 +319,19 @@ int main(void) {
 	/* 5) DMA 起動　(必ず PIO → DMA の順: FIFO が存在してから DMA を張る) */
 	dma_init_logger_with_ring_enabled(pio, sm);
 
+	// DMA / PIO 初期化完了後
+	cpu_read_count = 0;
+	dma_write_count = 0;
+	drop_seq = 0;
+	dma_lag = false;
+	drop_latched = false;
+	logger_armed = true;
 
     /* 6) USB があれば起動メッセージ */
-    if (stdio_usb_connected()) {
-        printf("\nMSX bus logger armed\n");
-        printf("Logger start @ %u us\n", now_us());
-    }
+    //if (stdio_usb_connected()) {
+    //    printf("\nMSX bus logger armed\n");
+    //    printf("Logger start @ %u us\n", now_us());
+    //}
 
 	/* 7) メインループ*/
 	while (1) {
@@ -317,23 +345,22 @@ int main(void) {
 			uint8_t  data  = raw & 0xFF;
 			uint8_t  flags = make_flags(raw);
 			uint16_t addr  = read_addr_pins();
-			uint8_t  timeL = now_us() & 0xFF;
-
+			uint8_t timeL = dma_irq_time_us & 0xFF;
+			
 			uint8_t rsv = drop_seq & 0x0F;
 			uint64_t pack = 0;
 			pack |= ((uint64_t)flags << 56);
 			pack |= ((uint64_t)rsv   << 48);
 			pack |= ((uint64_t)addr  << 32);
 			pack |= ((uint64_t)data  << 16);
-			pack |= ((uint64_t)timeL);
-
+			//pack |= ((uint64_t)timeL);
+			
 			log_buf64[log_wr_idx & LOG_BUF_MASK] = pack;
-
-			/* テキスト確認用（CDC） */
-			if (stdio_usb_connected()) {
-				printf("%02X,%02X,%04X,%02X,%02X\n",
-					   flags,rsv, addr, data, timeL);
+			static bool last = false;
+			if (drop_latched && !last) {
+				gpio_put(PICO_DEFAULT_LED_PIN, 1);
 			}
+			last = drop_latched;
 
 			log_wr_idx++;
 		}
