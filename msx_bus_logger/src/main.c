@@ -4,7 +4,7 @@
 #include "hardware/pio.h"
 #include "hardware/dma.h"
 
-#include "msx_rd_logger.pio.h"
+#include "msx_bus_logger.pio.h"
 
 /* ===== ピン定義（配線に合わせて変更） ===== */
 #define PIN_A0 0 //A0_3V3 
@@ -69,6 +69,9 @@ static bool dma_lag = false;
 static bool dma_lag_prev = false;
 
 volatile bool logger_armed = false;
+
+// Timestamp captured at DMA IRQ.
+// Used by main loop without calling time functions (performance critical).
 volatile uint32_t dma_irq_time_us;
 
 /* ===== ユーティリティ ===== */
@@ -116,8 +119,8 @@ void init_bus_pins(void) {
 }
 
 void pio_init_logger	(void) {
-    uint offset = pio_add_program(pio, &msx_rd_logger_program);
-    pio_sm_config c = msx_rd_logger_program_get_default_config(offset);
+    uint offset = pio_add_program(pio, &msx_bus_logger_program);
+    pio_sm_config c = msx_bus_logger_program_get_default_config(offset);
 
     // データピン D0-D7
     sm_config_set_in_pins(&c, PIN_D0);
@@ -176,6 +179,9 @@ void dma_init_logger(PIO pio, uint sm) {
 
 /* DMA ISR */
 void __isr dma_handler(void) {
+	// Latch timestamp once per DMA block.
+	// Calling time_us_32() per event is too expensive and caused FIFO drops.
+	// This timestamp is shared by all samples in the same DMA block.
 	dma_irq_time_us = time_us_32();// 32bit wrap（約71分）
     dma_hw->ints0 = 1u << dma_chan;
     dma_write_count += DMA_BLOCK_WORDS;
@@ -345,6 +351,8 @@ int main(void) {
 			uint8_t  data  = raw & 0xFF;
 			uint8_t  flags = make_flags(raw);
 			uint16_t addr  = read_addr_pins();
+			// Use timestamp latched in DMA IRQ.
+			// Avoid calling time functions here to prevent DMA/PIO stalls.
 			uint8_t timeL = dma_irq_time_us & 0xFF;
 			
 			uint8_t rsv = drop_seq & 0x0F;
@@ -361,6 +369,9 @@ int main(void) {
 				gpio_put(PICO_DEFAULT_LED_PIN, 1);
 			}
 			last = drop_latched;
+			
+			stdio_putchar_raw('0' + (rsv & 0x0F));
+			stdio_putchar_raw('\n');
 
 			log_wr_idx++;
 		}

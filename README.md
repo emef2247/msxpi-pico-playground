@@ -118,7 +118,8 @@ ls -l msx_bus_logger.uf2
 
 ---
 
-## MSXpi を MSX スロットで使用する場合の注意
+## MSXpiをMSXに装着し、MSXpiとHostPC間をUSBケーブルで繋ぐ場合は以下の点にご注意ください
+※ 電源逆流を避けるため、下記手順を必ず守ってください。
 
 ### 開始時
 
@@ -131,7 +132,6 @@ ls -l msx_bus_logger.uf2
 1. USB ケーブルを抜き、Host PC と MSXpi の接続を解除
 2. MSX の電源を OFF
 
-※ 電源逆流を避けるため、上記手順を必ず守ってください。
 
 ---
 
