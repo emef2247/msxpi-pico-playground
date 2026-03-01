@@ -1,16 +1,15 @@
-.program msx_bus_logger
-
+; msx_bus_logger.pio - updated for current pin mapping
 ; jmp pin = /IORQ (active low)
-; in pins = D0-D7 (8bit)
-
-; bit 0–7   = D0–D7   (GPIO 16–23)
-; bit 8     = RD      (GPIO 24)
-; bit 9     = WR      (GPIO 25)
-; bit 10    = IORQ    (GPIO 26)
-
+; in pins = D0..D7 + RD + WR (GPIO 19..28)
+; bit 0–7   = D0–D7   (GPIO 19–26)
+; bit 8     = RD      (GPIO 27)
+; bit 9     = WR      (GPIO 28)
+	
+; msx_bus_logger.pio (change in pins number to 10)
+.program msx_bus_logger
 loop:
-    wait 0 pin 0      ; /IORQ が Low（jmp pin = pin 0）
-    in   pins, 11     ; GPIO16(D0)から 26(IORQ)までの連続した11本を一気に取得
-    push block        ; FIFO へ
-    wait 1 pin 0      ; /IORQ が High に戻るまで待つ
-    jmp  loop
+    wait 0 pin 0
+    in   pins, 10   ; read GPIO19..28 => D0..D7, RD, WR
+    push block
+    wait 1 pin 0
+    jmp loop
