@@ -39,8 +39,8 @@
 #define PIN_RESET 29 // MSX /RESET（読むだけ）
 
 /* リングバッファ */
-#define DMA_BLOCK_WORDS 512 // DMA がIRQを出すまでに行うPIO->DMA間の転送回数
-#define LOG_ENTRIES (8 * 1024)   // 8K entries
+#define DMA_BLOCK_WORDS 32 // DMA がIRQを出すまでに行うPIO->DMA間の転送回数
+#define LOG_ENTRIES (16 * 1024)   // 16K entries
 #define LOG_BUF_MASK (LOG_ENTRIES - 1)
 
 /* ===== グローバル変数 ===== */
@@ -49,8 +49,15 @@ uint sm = 0;
 int dma_chan;
 dma_channel_config dma_cfg;
 
-volatile uint32_t dma_write_count = 0;
-uint32_t cpu_read_count = 0;
+/* ===== DROP 及び カウンタ ===== */
+volatile uint32_t dma_wr_count = 0;      // DMA 論理総パケット数
+volatile uint32_t cpu_rd_count = 0;      // CPU 読み込みカウンタ
+
+volatile bool dma_raw_drop = false;
+volatile uint32_t dma_raw_drop_count = 0;
+
+volatile bool cpu_log_drop = false;
+volatile uint32_t cpu_log_drop_count = 0;
 
 /* DMA 生ログ（PIO→DMA） */
 uint32_t dma_raw_buf[LOG_ENTRIES];
@@ -69,6 +76,7 @@ static bool dma_lag = false;
 static bool dma_lag_prev = false;
 
 volatile bool logger_armed = false;
+
 
 // Timestamp captured at DMA IRQ.
 // Used by main loop without calling time functions (performance critical).
@@ -179,29 +187,29 @@ void dma_init_logger(PIO pio, uint sm) {
 
 /* DMA ISR */
 void __isr dma_handler(void) {
-	// Latch timestamp once per DMA block.
-	// Calling time_us_32() per event is too expensive and caused FIFO drops.
-	// This timestamp is shared by all samples in the same DMA block.
-	dma_irq_time_us = time_us_32();// 32bit wrap（約71分）
-    dma_hw->ints0 = 1u << dma_chan;
-    dma_write_count += DMA_BLOCK_WORDS;
+    // latch timestamp once per DMA block
+    dma_irq_time_us = time_us_32();
 
-    dma_channel_set_read_addr(dma_chan, &pio->rxf[sm], false);
-	dma_channel_set_write_addr(
-		dma_chan,
-		&dma_raw_buf[dma_wr_idx & LOG_BUF_MASK],
-		true
-	);
-	
-	if (!logger_armed) return;
-	
-	// DMA 遅延検出（リングバッファ基準）
-	uint32_t pending = dma_write_count - cpu_read_count;
-	if (pending > LOG_ENTRIES) {
-		dma_lag = true;
-		drop_latched = true;
-		drop_seq++;
+    dma_hw->ints0 = 1u << dma_chan;
+
+    // ---- DMA logical increment ----
+    dma_wr_count += DMA_BLOCK_WORDS;
+
+    // ---- DROP (raw) ----
+	if (logger_armed) {
+		if (dma_wr_count - cpu_rd_count > LOG_ENTRIES) {
+			dma_raw_drop = true;
+			dma_raw_drop_count++;
+		}
 	}
+
+    // ---- re-configure next DMA transfer ----
+    dma_channel_set_read_addr(dma_chan, &pio->rxf[sm], false);
+    dma_channel_set_write_addr(
+        dma_chan,
+        &dma_raw_buf[dma_wr_count & LOG_BUF_MASK],
+        true
+    );
 }
 
 void dma_init_logger_with_ring_enabled(PIO pio, uint sm) {
@@ -294,7 +302,7 @@ static inline uint8_t make_flags(uint32_t pio_v) {
     if (gpio_get(PIN_SLTSL))   f |= 1 << 3; // EXT SLOT
 
     /* DROP 系（状態フラグ） */
-    if (drop_latched)          f |= 1 << 4; // DROP_LATCHED
+    if (dma_raw_drop)          f |= 1 << 4; // Overwite the packet stored in dma_raw_buf
     if (fifo_overflow)         f |= 1 << 5; // FIFO_OVERFLOW
     if (dma_lag)               f |= 1 << 6; // DMA_LAG
 
@@ -321,16 +329,19 @@ int main(void) {
 	/* 4) MSX が起きたので PIO ロガー開始 */
 	pio_init_logger();
 	
+	// ---- 論理カウンタ初期化（IRQ が来る前に必須） ----
+	cpu_rd_count = 0;
+	dma_wr_count = 0;
+	dma_raw_drop = false;
+	dma_raw_drop_count = 0;
+	drop_seq = 0;
+	dma_lag = false;
 
 	/* 5) DMA 起動　(必ず PIO → DMA の順: FIFO が存在してから DMA を張る) */
 	dma_init_logger_with_ring_enabled(pio, sm);
 
 	// DMA / PIO 初期化完了後
-	cpu_read_count = 0;
-	dma_write_count = 0;
-	drop_seq = 0;
-	dma_lag = false;
-	drop_latched = false;
+	gpio_put(PICO_DEFAULT_LED_PIN, 0);//DMAを起動直後 LED を一度明示的に消す
 	logger_armed = true;
 
     /* 6) USB があれば起動メッセージ */
@@ -341,12 +352,14 @@ int main(void) {
 
 	/* 7) メインループ*/
 	while (1) {
-		uint32_t written = dma_write_count;
+		uint32_t written = dma_wr_count;
+		while (cpu_rd_count < written) {
+	
+			/* CPUのraw読み込み */
+			uint32_t raw = dma_raw_buf[cpu_rd_count & LOG_BUF_MASK];
 
-		while (log_wr_idx < written) {
-			uint32_t raw = dma_raw_buf[log_wr_idx & LOG_BUF_MASK];
-			cpu_read_count++;
-			if (dma_lag) fifo_overflow = true;
+			/* CPU 上の生ポインタ更新 */
+			cpu_rd_count++;
 			
 			uint8_t  data  = raw & 0xFF;
 			uint8_t  flags = make_flags(raw);
@@ -364,16 +377,16 @@ int main(void) {
 			//pack |= ((uint64_t)timeL);
 			
 			log_buf64[log_wr_idx & LOG_BUF_MASK] = pack;
+			log_wr_idx++;
 			static bool last = false;
-			if (drop_latched && !last) {
+			if (dma_raw_drop && !last) {
 				gpio_put(PICO_DEFAULT_LED_PIN, 1);
 			}
-			last = drop_latched;
+			last = dma_raw_drop;
 			
-			stdio_putchar_raw('0' + (rsv & 0x0F));
-			stdio_putchar_raw('\n');
+			//stdio_putchar_raw('0' + (rsv & 0x0F));
+			//stdio_putchar_raw('\n');
 
-			log_wr_idx++;
 		}
 
 		tight_loop_contents();
