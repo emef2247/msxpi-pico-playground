@@ -40,68 +40,50 @@
 #define PIN_IORQ  26  // /IORQ
 #define PIN_SLTSL 27  // /SLTSL
 #define PIN_WAIT  28  // /WAIT
-#define PIN_BUSDIR 29 // BUSDIR
+#define PIN_BUSDIR 29 // BUSDIR（未使用）
 
 /* ===== 設定 ===== */
 #define DMA_BLOCK_WORDS 128
 #define LOG_ENTRIES (8 * 1024)
 #define LOG_BUF_MASK (LOG_ENTRIES - 1)
 
-#define POWER_STABLE_MS      300
-#define INIT_DISCARD_BLOCKS  2
-
 /* ===== グローバル変数 ===== */
 PIO pio = pio0;
 uint sm = 0;
 int dma_chan;
 dma_channel_config dma_cfg;
-volatile bool dma_irq_seen = false;
-volatile bool drop_event_seen = false;
-volatile bool severe_pending = false;
 
 /* カウンタ */
 volatile uint32_t dma_write_count = 0;
 volatile uint32_t cpu_read_count = 0;
 
-volatile bool dma_raw_drop = false;
-volatile uint32_t dma_raw_drop_count = 0;
-
-volatile bool cpu_log_drop = false;
-volatile uint32_t cpu_log_drop_count = 0;
-
 uint32_t dma_raw_buf[LOG_ENTRIES];
-uint64_t log_buf64[LOG_ENTRIES];
+uint64_t log_buf64[LOG_ENTRIES]; /* 将来のバイナリ転送に備えて保持 */
 
 volatile uint32_t dma_wr_idx = 0;
 volatile uint32_t log_wr_idx = 0;
 
 static bool drop_latched = false;
 static uint8_t drop_seq = 0;
-static bool fifo_overflow = false;
 static bool dma_lag = false;
-static bool dma_lag_prev = false;
 
 volatile bool logger_armed = false;
 volatile uint32_t dma_irq_time_us;
 
-extern PIO pio;
-extern uint sm;
-extern int dma_chan;
-
 /* ユーティリティ */
-static inline uint32_t now_us(void) {
-    return to_us_since_boot(get_absolute_time());
-}
-
 static inline uint32_t now_ms(void) {
     return to_ms_since_boot(get_absolute_time());
 }
 
-
 void enter_safe_state(void) {
-    gpio_init(PIN_RD); gpio_set_dir(PIN_RD, GPIO_OUT); gpio_put(PIN_RD, 1);
-    gpio_init(PIN_WR); gpio_set_dir(PIN_WR, GPIO_OUT); gpio_put(PIN_WR, 1);
-    gpio_init(PIN_WAIT); gpio_set_dir(PIN_WAIT, GPIO_OUT); gpio_pull_up(PIN_WAIT); gpio_put(PIN_WAIT, 1);
+    /* /RD と /WR は OUT+High（MSXロゴ表示のために必須） */
+    gpio_init(PIN_RD);    gpio_set_dir(PIN_RD,    GPIO_OUT); gpio_put(PIN_RD,    1);
+    gpio_init(PIN_WR);    gpio_set_dir(PIN_WR,    GPIO_OUT); gpio_put(PIN_WR,    1);
+    /* /WAIT は OUT+High+プルアップ */
+    gpio_init(PIN_WAIT);  gpio_set_dir(PIN_WAIT,  GPIO_OUT); gpio_pull_up(PIN_WAIT); gpio_put(PIN_WAIT, 1);
+    /* その他の制御線は入力（Hi-Z） */
+    gpio_init(PIN_IORQ);  gpio_set_dir(PIN_IORQ,  GPIO_IN);  gpio_disable_pulls(PIN_IORQ);
+    gpio_init(PIN_SLTSL); gpio_set_dir(PIN_SLTSL, GPIO_IN);  gpio_disable_pulls(PIN_SLTSL);
 }
 
 void pio_init_logger(void) {
@@ -110,51 +92,48 @@ void pio_init_logger(void) {
 
     sm_config_set_in_pins(&c, PIN_D0);
     sm_config_set_jmp_pin(&c, PIN_IORQ);
-    sm_config_set_in_shift(&c, false, false, 32);
+    sm_config_set_in_shift(&c,
+        false,  /* 左シフト */
+        false,  /* autopush 無効（.pio が手動 push するため） */
+        32      /* threshold（autopush 無効時は参照されないが明示的に設定） */
+    );
 
-    int data_pins[] = {PIN_D0,PIN_D1,PIN_D2,PIN_D3,PIN_D4,PIN_D5,PIN_D6,PIN_D7};
-    for (int i = 0; i < 8; ++i) {
-        int p = data_pins[i];
-        if (p == 24 || p == 25) continue;
-        gpio_init(p); gpio_set_dir(p, GPIO_IN); gpio_pull_up(p);
-        pio_gpio_init(pio, p);
-        pio_sm_set_consecutive_pindirs(pio, sm, p, 1, false);
+    /* GPIO16〜26（D0-D7 + /RD + /WR + /IORQ）を PIO 入力として初期化
+     * プルアップは設定しない：/RD, /WR は MSX 側で駆動される出力線、
+     * D0-D7 は MSX がドライブするデータバスであるため不要 */
+    for (int i = PIN_D0; i <= PIN_IORQ; i++) {
+        pio_gpio_init(pio, i);
+        pio_sm_set_consecutive_pindirs(pio, sm, i, 1, false);
     }
-
-    gpio_init(PIN_RD); gpio_set_dir(PIN_RD, GPIO_IN); gpio_pull_up(PIN_RD);
-    pio_gpio_init(pio, PIN_RD); pio_sm_set_consecutive_pindirs(pio, sm, PIN_RD, 1, false);
-
-    gpio_init(PIN_WR); gpio_set_dir(PIN_WR, GPIO_IN); gpio_pull_up(PIN_WR);
-    pio_gpio_init(pio, PIN_WR); pio_sm_set_consecutive_pindirs(pio, sm, PIN_WR, 1, false);
-
-    gpio_init(PIN_IORQ); gpio_set_dir(PIN_IORQ, GPIO_IN); gpio_pull_up(PIN_IORQ);
-    pio_gpio_init(pio, PIN_IORQ);
 
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
 
+    /* オンボードLED初期化 */
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
     gpio_put(PICO_DEFAULT_LED_PIN, 0);
 }
 
 void __isr dma_handler(void) {
-    dma_hw->ints0 = 1u << dma_chan;
-    dma_irq_seen = true;
     dma_irq_time_us = time_us_32();
-    __atomic_thread_fence(__ATOMIC_ACQ_REL);
-    dma_write_count += DMA_BLOCK_WORDS;
-    __atomic_thread_fence(__ATOMIC_ACQ_REL);
+    dma_hw->ints0 = 1u << dma_chan;
 
-    if (logger_armed) {
-        uint32_t pending = dma_write_count - cpu_read_count;
-        if (pending > LOG_ENTRIES) {
-            dma_lag = true;
-            drop_latched = true;
-            drop_seq++;
-            drop_event_seen = true;
-            dma_raw_drop_count++;
-        }
+    /* dma_wr_idx を進めてからリングバッファの次のブロック先頭を書き込み先にセット */
+    dma_wr_idx += DMA_BLOCK_WORDS;
+    dma_write_count = dma_wr_idx;
+
+    dma_channel_set_read_addr(dma_chan, &pio->rxf[sm], false);
+    dma_channel_set_write_addr(dma_chan, &dma_raw_buf[dma_wr_idx & LOG_BUF_MASK], true);
+
+    if (!logger_armed) return;
+
+    /* DROP 検出（リングバッファのオーバーラン） */
+    uint32_t pending = dma_write_count - cpu_read_count;
+    if (pending > LOG_ENTRIES) {
+        dma_lag = true;
+        drop_latched = true;
+        drop_seq++;
     }
 }
 
@@ -166,7 +145,7 @@ void dma_init_logger_with_ring_enabled(PIO pio, uint sm) {
     channel_config_set_dreq(&dma_cfg, pio_get_dreq(pio, sm, false));
     channel_config_set_read_increment(&dma_cfg, false);
     channel_config_set_write_increment(&dma_cfg, true);
-    channel_config_set_chain_to(&dma_cfg, dma_chan);
+    channel_config_set_chain_to(&dma_cfg, dma_chan); /* 自身へのチェーン（チェーン無効） */
 
     dma_channel_configure(dma_chan, &dma_cfg,
                           dma_raw_buf, &pio->rxf[sm],
@@ -181,43 +160,31 @@ void dma_init_logger_with_ring_enabled(PIO pio, uint sm) {
 
 static inline uint8_t make_flags(uint32_t pio_v) {
     uint8_t f = 0;
-    if (!(pio_v & (1u << 8)))  f |= 1 << 0;
-    if (!(pio_v & (1u << 9)))  f |= 1 << 1;
-    if (!gpio_get(PIN_IORQ))   f |= 1 << 2;
-    if (gpio_get(PIN_SLTSL))   f |= 1 << 3;
-    if (drop_latched)          f |= 1 << 4;
-    if (fifo_overflow)         f |= 1 << 5;
-    if (dma_lag)               f |= 1 << 6;
+    if (!(pio_v & (1u << 8)))  f |= 1 << 0; /* /RD がアサート → RD フラグ */
+    if (!(pio_v & (1u << 9)))  f |= 1 << 1; /* /WR がアサート → WR フラグ */
+    if (!(pio_v & (1u << 10))) f |= 1 << 2; /* /IORQ がアサート → IO フラグ */
+    if (drop_latched)          f |= 1 << 4; /* DROP ラッチフラグ */
+    if (dma_lag)               f |= 1 << 6; /* DMA 遅延フラグ */
     return f;
 }
 
-static const int addr_pins[16] = {
-    PIN_A0, PIN_A1, PIN_A2, PIN_A3,
-    PIN_A4, PIN_A5, PIN_A6, PIN_A7,
-    PIN_A8, PIN_A9, PIN_A10, PIN_A11,
-    PIN_A12, PIN_A13, PIN_A14, PIN_A15
-};
-
 static inline uint16_t read_addr_pins(void) {
-    uint16_t addr = 0;
-    for (int i = 0; i < 16; i++) addr |= (gpio_get(addr_pins[i]) << i);
-    return addr;
+    /* GPIO0-15 = A0-A15 なので下位16bitをそのまま使う */
+    return (uint16_t)(gpio_get_all() & 0xFFFF);
 }
 
 /* ===== メイン ===== */
 int main(void) {
     stdio_init_all();
-	sleep_ms(250); // wait for USB serial connection if needed
-    printf("msx_bus_logger: startup (safe-mode)\n");
+    sleep_ms(250);
+    printf("msx_bus_logger: 起動（セーフモード）\n");
     enter_safe_state();
 
-    //sleep_ms(10000);
-
     pio_init_logger();
-    printf("\n[SETUP] pio_init_logger() done.\n");
+    printf("[SETUP] pio_init_logger() 完了\n");
 
     dma_init_logger_with_ring_enabled(pio, sm);
-    printf("\n[SETUP] dma_init_logger_with_ring_enabled() done.\n");
+    printf("[SETUP] dma_init_logger_with_ring_enabled() 完了\n");
 
     __atomic_store_n(&cpu_read_count, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&dma_write_count, 0u, __ATOMIC_RELEASE);
@@ -226,14 +193,11 @@ int main(void) {
     drop_latched = false;
     logger_armed = false;
 
-    //const uint32_t expected_initial = DMA_BLOCK_WORDS * INIT_DISCARD_BLOCKS;
-    //while (__atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE) < expected_initial) tight_loop_contents();
-
     __atomic_store_n(&cpu_read_count, __atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
     log_wr_idx = __atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE) & LOG_BUF_MASK;
 
     logger_armed = true;
-    printf("\n[START] MAIN LOOP START\n");
+    printf("[START] メインループ開始\n");
 
     const uint32_t status_interval_ms = 1000;
     uint32_t last_status_ms = now_ms();
@@ -241,62 +205,13 @@ int main(void) {
 
     while (1) {
         uint32_t written = __atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE);
-        static uint32_t led_until_us = 0;
-        static bool led_on = false;
 
-        if (dma_irq_seen) {
-            dma_irq_seen = false;
-            gpio_put(PICO_DEFAULT_LED_PIN, 1);
-            led_on = true;
-            led_until_us = now_us() + 10000;
-        }
+        /* DROP 中はLEDを点灯 */
+        gpio_put(PICO_DEFAULT_LED_PIN, drop_latched ? 1 : 0);
 
-        if (drop_event_seen) {
-            drop_event_seen = false;
-            uint32_t w = __atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE);
-            uint32_t r = __atomic_load_n(&cpu_read_count, __ATOMIC_ACQUIRE);
-            uint32_t pending = (w >= r) ? (w - r) : 0;
-            if (pending > LOG_ENTRIES) {
-                uint32_t overrun = pending - LOG_ENTRIES;
-                dma_raw_drop = true;
-                dma_raw_drop_count += overrun;
-                uint32_t new_r = w - LOG_ENTRIES;
-                __atomic_store_n(&cpu_read_count, new_r, __ATOMIC_RELEASE);
-                drop_latched = true;
-                dma_lag = true;
-            }
-
-            uint32_t r_after = __atomic_load_n(&cpu_read_count, __ATOMIC_ACQUIRE);
-            uint32_t pending_after = (__atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE) - r_after);
-            printf("[EVENT] DROP detected: drop_seq=%u pending=%u dma_lag=%d",
-                   (unsigned)drop_seq, (unsigned)pending_after, dma_lag);
-
-            const int N = 8;
-            uint32_t start = (r_after - N) & LOG_BUF_MASK;
-            printf("Recent raw samples:");
-            for (int i = 0; i < N; ++i) {
-                uint32_t s = dma_raw_buf[(start + i) & LOG_BUF_MASK];
-                printf(" %08x", s);
-            }
-            printf("\n");
-
-            gpio_put(PICO_DEFAULT_LED_PIN, 1);
-            led_on = true;
-            led_until_us = now_us() + 200;
-        }
-
-        if (drop_latched) {
-            gpio_put(PICO_DEFAULT_LED_PIN, 1);
-            led_on = true;
-        } else {
-            if (led_on && now_us() > led_until_us) {
-                gpio_put(PICO_DEFAULT_LED_PIN, 0);
-                led_on = false;
-            }
-        }
-
+        /* 1秒ごとのステータス出力 */
         uint32_t now = now_ms();
-        if ((int32_t)(now - last_status_ms) >= 0 && now - last_status_ms >= status_interval_ms) {
+        if (now - last_status_ms >= status_interval_ms) {
             uint32_t w = __atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE);
             uint32_t r = __atomic_load_n(&cpu_read_count, __ATOMIC_ACQUIRE);
             uint32_t pending = (w >= r) ? (w - r) : 0;
@@ -305,45 +220,51 @@ int main(void) {
             last_write_count = w;
             last_status_ms = now;
 
-            uint32_t write_idx = w & LOG_BUF_MASK;
-            uint32_t read_idx = r & LOG_BUF_MASK;
-            uint32_t used = (pending > LOG_ENTRIES) ? LOG_ENTRIES : pending;
-
-            printf("[STATUS] w=%u r=%u pending=%u used=%u w_idx=0x%04x r_idx=0x%04x rate=%0.1f w/s drop_seq=%u drops=%u\n",
-                   (unsigned)w, (unsigned)r, (unsigned)pending, (unsigned)used,
-                   (unsigned)write_idx, (unsigned)read_idx, rate_wps,
-                   (unsigned)drop_seq, (unsigned)dma_raw_drop_count);
+            printf("[STATUS] w=%u r=%u pending=%u rate=%0.1f w/s drop_seq=%u\n",
+                   (unsigned)w, (unsigned)r, (unsigned)pending, rate_wps, (unsigned)drop_seq);
         }
 
+        /* DMA バッファから読み出してログ出力 */
         while (__atomic_load_n(&cpu_read_count, __ATOMIC_ACQUIRE) < written) {
             uint32_t idx = __atomic_load_n(&cpu_read_count, __ATOMIC_ACQUIRE) & LOG_BUF_MASK;
             uint32_t raw = dma_raw_buf[idx];
 
             __atomic_store_n(&cpu_read_count, __atomic_load_n(&cpu_read_count, __ATOMIC_ACQUIRE) + 1u, __ATOMIC_RELEASE);
 
-            uint8_t data = raw & 0xFF;
+            uint8_t data  = (uint8_t)(raw & 0xFF);
             uint8_t flags = make_flags(raw);
             uint16_t addr = read_addr_pins();
-            uint8_t timeL = dma_irq_time_us & 0xFF;
 
-            uint8_t rsv = drop_seq & 0x0F;
-            uint64_t pack = 0;
-            pack |= ((uint64_t)flags << 56);
-            pack |= ((uint64_t)rsv   << 48);
-            pack |= ((uint64_t)addr  << 32);
-            pack |= ((uint64_t)data  << 16);
-
+            /* log_buf64 に格納（将来のバイナリ転送に備えて） */
+            uint64_t pack = ((uint64_t)flags    << 56)
+                          | ((uint64_t)drop_seq  << 48)
+                          | ((uint64_t)addr      << 32)
+                          | ((uint64_t)data      << 16);
             log_buf64[log_wr_idx & LOG_BUF_MASK] = pack;
             log_wr_idx++;
+
+            /* USB Serial にテキスト出力
+             * アクセス種別ラベル: IO（/IORQ）を最優先、次に RD、WR の順
+             * /IORQ 監視構成では IO フラグは常に立つため、実質 IO ラベルが選ばれる */
+            const char *label = (flags & (1 << 2)) ? "IO"
+                               : (flags & (1 << 0)) ? "RD"
+                               : (flags & (1 << 1)) ? "WR"
+                               : "--";
+            if (drop_latched) {
+                printf("%s A=%04X D=%02X F=%02X [DROP seq=%u]\n",
+                       label, addr, data, flags, (unsigned)drop_seq);
+            } else {
+                printf("%s A=%04X D=%02X F=%02X\n", label, addr, data, flags);
+            }
         }
 
+        /* 'c' キーで DROP フラグをリセット */
         int ch = getchar_timeout_us(0);
         if (ch == 'c') {
             drop_latched = false;
             drop_seq = 0;
-            fifo_overflow = false;
             dma_lag = false;
-            printf("[CMD] Cleared drop_latched\n");
+            printf("[CMD] drop_latched をクリア\n");
         }
 
         tight_loop_contents();
