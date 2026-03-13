@@ -47,6 +47,13 @@
 #define LOG_ENTRIES (8 * 1024)
 #define LOG_BUF_MASK (LOG_ENTRIES - 1)
 
+/* ===== LED 点滅モード ===== */
+typedef enum {
+    LED_OFF,        /* 消灯: DROP なし */
+    LED_BLINK_SLOW, /* 0.5Hz（2000ms周期、1000msトグル間隔）: DROP あり・軽微（直近1秒の増分 1〜9） */
+    LED_BLINK_FAST, /* 2Hz（500ms周期、250msトグル間隔）: DROP あり・重大（直近1秒の増分 10以上） */
+} LedMode;
+
 /* ===== グローバル変数 ===== */
 PIO pio = pio0;
 uint sm = 0;
@@ -70,6 +77,11 @@ static bool dma_lag = false;
 volatile bool logger_armed = false;
 volatile uint32_t dma_irq_time_us;
 
+/* LED 状態 */
+static LedMode  led_mode           = LED_OFF;
+static uint32_t led_last_toggle_ms = 0;
+static bool     led_state          = false;
+
 /* ユーティリティ */
 static inline uint32_t now_ms(void) {
     return to_ms_since_boot(get_absolute_time());
@@ -90,18 +102,17 @@ void pio_init_logger(void) {
     uint offset = pio_add_program(pio, &msx_bus_logger_program);
     pio_sm_config c = msx_bus_logger_program_get_default_config(offset);
 
-    sm_config_set_in_pins(&c, PIN_D0);
+    /* in_base = GPIO0 (A0): in pins, 32 でアドレス+データ+制御線を一括取り込む */
+    sm_config_set_in_pins(&c, PIN_A0);
     sm_config_set_jmp_pin(&c, PIN_IORQ);
-    sm_config_set_in_shift(&c,
-        false,  /* 左シフト */
-        false,  /* autopush 無効（.pio が手動 push するため） */
-        32      /* threshold（autopush 無効時は参照されないが明示的に設定） */
-    );
 
-    /* GPIO16〜26（D0-D7 + /RD + /WR + /IORQ）を PIO 入力として初期化
-     * プルアップは設定しない：/RD, /WR は MSX 側で駆動される出力線、
-     * D0-D7 は MSX がドライブするデータバスであるため不要 */
-    for (int i = PIN_D0; i <= PIN_IORQ; i++) {
+    /* 左シフト、autopush 無効（.pio が手動 push するため）、threshold=32 */
+    sm_config_set_in_shift(&c, true, false, 32);
+
+    /* GPIO0-23（A0-A15, D0-D7）を PIO 入力として初期化
+     * GPIO24-26（/RD, /WR, /IORQ）は pio_gpio_init() しない
+     * （enter_safe_state() の OUT+High 設定を維持するため） */
+    for (int i = PIN_A0; i <= PIN_D7; i++) {
         pio_gpio_init(pio, i);
         pio_sm_set_consecutive_pindirs(pio, sm, i, 1, false);
     }
@@ -158,19 +169,49 @@ void dma_init_logger_with_ring_enabled(PIO pio, uint sm) {
     dma_start_channel_mask(1u << dma_chan);
 }
 
-static inline uint8_t make_flags(uint32_t pio_v) {
+/* PIO raw 値からアドレスを取り出す
+ * ISR[15:0] = GPIO0-15 = A0-A15 */
+static inline uint16_t extract_addr(uint32_t raw) {
+    return (uint16_t)(raw & 0xFFFF);
+}
+
+/* PIO raw 値からデータを取り出す
+ * ISR[23:16] = GPIO16-23 = D0-D7 */
+static inline uint8_t extract_data(uint32_t raw) {
+    return (uint8_t)((raw >> 16) & 0xFF);
+}
+
+/* FLAGS バイトを生成する
+ * ISR[24] = /RD  (GPIO24) : Low=アサート
+ * ISR[25] = /WR  (GPIO25) : Low=アサート
+ * ISR[26] = /IORQ(GPIO26) : Low=アサート */
+static inline uint8_t make_flags(uint32_t raw) {
     uint8_t f = 0;
-    if (!(pio_v & (1u << 8)))  f |= 1 << 0; /* /RD がアサート → RD フラグ */
-    if (!(pio_v & (1u << 9)))  f |= 1 << 1; /* /WR がアサート → WR フラグ */
-    if (!(pio_v & (1u << 10))) f |= 1 << 2; /* /IORQ がアサート → IO フラグ */
-    if (drop_latched)          f |= 1 << 4; /* DROP ラッチフラグ */
-    if (dma_lag)               f |= 1 << 6; /* DMA 遅延フラグ */
+    if (!(raw & (1u << 24))) f |= 1 << 0; /* /RD がアサート → RD フラグ */
+    if (!(raw & (1u << 25))) f |= 1 << 1; /* /WR がアサート → WR フラグ */
+    if (!(raw & (1u << 26))) f |= 1 << 2; /* /IORQ がアサート → IO フラグ */
+    if (drop_latched)        f |= 1 << 4; /* DROP ラッチフラグ */
+    if (dma_lag)             f |= 1 << 6; /* DMA 遅延フラグ */
     return f;
 }
 
-static inline uint16_t read_addr_pins(void) {
-    /* GPIO0-15 = A0-A15 なので下位16bitをそのまま使う */
-    return (uint16_t)(gpio_get_all() & 0xFFFF);
+/* LED 更新（メインループで毎回呼ぶ）
+ * LED_OFF        : 消灯
+ * LED_BLINK_SLOW : 1000ms ごとにトグル（0.5Hz、2000ms周期）
+ * LED_BLINK_FAST : 250ms ごとにトグル（2Hz、500ms周期） */
+static void update_led(uint32_t now_ms_val) {
+    if (led_mode == LED_OFF) {
+        gpio_put(PICO_DEFAULT_LED_PIN, 0);
+        led_state = false;
+        return;
+    }
+    /* 点滅周期の半分をトグル間隔とする */
+    uint32_t half_period_ms = (led_mode == LED_BLINK_FAST) ? 250u : 1000u;
+    if (now_ms_val - led_last_toggle_ms >= half_period_ms) {
+        led_state = !led_state;
+        gpio_put(PICO_DEFAULT_LED_PIN, led_state ? 1 : 0);
+        led_last_toggle_ms = now_ms_val;
+    }
 }
 
 /* ===== メイン ===== */
@@ -202,50 +243,74 @@ int main(void) {
     const uint32_t status_interval_ms = 1000;
     uint32_t last_status_ms = now_ms();
     uint32_t last_write_count = __atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE);
+    uint8_t  last_drop_seq   = drop_seq;
 
     while (1) {
-        uint32_t written = __atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE);
+        uint32_t now = now_ms();
 
-        /* DROP 中はLEDを点灯 */
-        gpio_put(PICO_DEFAULT_LED_PIN, drop_latched ? 1 : 0);
+        /* LED 更新（毎ループ） */
+        update_led(now);
 
         /* 1秒ごとのステータス出力 */
-        uint32_t now = now_ms();
         if (now - last_status_ms >= status_interval_ms) {
             uint32_t w = __atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE);
-            uint32_t r = __atomic_load_n(&cpu_read_count, __ATOMIC_ACQUIRE);
+            uint32_t r = __atomic_load_n(&cpu_read_count,  __ATOMIC_ACQUIRE);
             uint32_t pending = (w >= r) ? (w - r) : 0;
             uint32_t delta = w - last_write_count;
             float rate_wps = (float)delta / ((now - last_status_ms) / 1000.0f);
-            last_write_count = w;
-            last_status_ms = now;
 
-            printf("[STATUS] w=%u r=%u pending=%u rate=%0.1f w/s drop_seq=%u\n",
-                   (unsigned)w, (unsigned)r, (unsigned)pending, rate_wps, (unsigned)drop_seq);
+            /* drop_seq の直近1秒間の増分で LED モードを決定 */
+            uint8_t delta_drop = (uint8_t)(drop_seq - last_drop_seq);
+            last_drop_seq = drop_seq;
+
+            if (!drop_latched) {
+                led_mode = LED_OFF;
+            } else if (delta_drop >= 10) {
+                led_mode = LED_BLINK_FAST;
+            } else {
+                led_mode = LED_BLINK_SLOW;
+            }
+
+            printf("[STATUS] w=%u r=%u pending=%u rate=%.1f w/s drop_seq=%u led=%s\n",
+                   (unsigned)w, (unsigned)r, (unsigned)pending, rate_wps, (unsigned)drop_seq,
+                   led_mode == LED_OFF ? "OFF" : led_mode == LED_BLINK_SLOW ? "SLOW" : "FAST");
+
+            last_write_count = w;
+            last_status_ms   = now;
         }
 
         /* DMA バッファから読み出してログ出力 */
+        uint32_t written = __atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE);
         while (__atomic_load_n(&cpu_read_count, __ATOMIC_ACQUIRE) < written) {
             uint32_t idx = __atomic_load_n(&cpu_read_count, __ATOMIC_ACQUIRE) & LOG_BUF_MASK;
             uint32_t raw = dma_raw_buf[idx];
 
-            __atomic_store_n(&cpu_read_count, __atomic_load_n(&cpu_read_count, __ATOMIC_ACQUIRE) + 1u, __ATOMIC_RELEASE);
+            __atomic_store_n(&cpu_read_count,
+                             __atomic_load_n(&cpu_read_count, __ATOMIC_ACQUIRE) + 1u,
+                             __ATOMIC_RELEASE);
 
-            uint8_t data  = (uint8_t)(raw & 0xFF);
-            uint8_t flags = make_flags(raw);
-            uint16_t addr = read_addr_pins();
+            uint16_t addr  = extract_addr(raw);   /* PIO サンプル値からアドレスを正確に取得 */
+            uint8_t  data  = extract_data(raw);
+            uint8_t  flags = make_flags(raw);
 
-            /* log_buf64 に格納（将来のバイナリ転送に備えて） */
-            uint64_t pack = ((uint64_t)flags    << 56)
-                          | ((uint64_t)drop_seq  << 48)
-                          | ((uint64_t)addr      << 32)
-                          | ((uint64_t)data      << 16);
+            /* log_buf64 パック形式:
+             * [63:56] FLAGS
+             * [55:48] DROP_SEQ
+             * [47:32] ADDR (A0-A15)
+             * [31:16] DATA (D0-D7、上位8bitは0)
+             * [15:0]  タイムスタンプ下位16bit（dma_irq_time_us & 0xFFFF）
+             */
+            uint32_t ts = __atomic_load_n(&dma_irq_time_us, __ATOMIC_ACQUIRE);
+            uint64_t pack = ((uint64_t)flags                     << 56)
+                          | ((uint64_t)drop_seq                  << 48)
+                          | ((uint64_t)addr                      << 32)
+                          | ((uint64_t)data                      << 16)
+                          | ((uint64_t)(ts & 0xFFFF)                  );
             log_buf64[log_wr_idx & LOG_BUF_MASK] = pack;
             log_wr_idx++;
 
-            /* USB Serial にテキスト出力
-             * アクセス種別ラベル: IO（/IORQ）を最優先、次に RD、WR の順
-             * /IORQ 監視構成では IO フラグは常に立つため、実質 IO ラベルが選ばれる */
+            /* USB Serial にテキスト出力（デバッグ用）
+             * アクセス種別ラベル: IO（/IORQ）を最優先、次に RD、WR の順 */
             const char *label = (flags & (1 << 2)) ? "IO"
                                : (flags & (1 << 0)) ? "RD"
                                : (flags & (1 << 1)) ? "WR"
@@ -262,8 +327,10 @@ int main(void) {
         int ch = getchar_timeout_us(0);
         if (ch == 'c') {
             drop_latched = false;
-            drop_seq = 0;
-            dma_lag = false;
+            drop_seq     = 0;
+            dma_lag      = false;
+            last_drop_seq = 0;
+            led_mode     = LED_OFF;
             printf("[CMD] drop_latched をクリア\n");
         }
 
