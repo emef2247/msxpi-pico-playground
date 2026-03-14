@@ -43,7 +43,10 @@
 #define PIN_BUSDIR 29 // BUSDIR（未使用）
 
 /* ===== 設定 ===== */
-#define DMA_BLOCK_WORDS 128
+/* 1: printfテキスト出力（デバッグ用）、0: バイナリ転送（本番用） */
+#define TEXT_MODE 1
+
+#define DMA_BLOCK_WORDS 512   /* 128 から増加: DMA IRQ 過多によるDROP防止 */
 #define LOG_ENTRIES (8 * 1024)
 #define LOG_BUF_MASK (LOG_ENTRIES - 1)
 
@@ -214,18 +217,64 @@ static void update_led(uint32_t now_ms_val) {
     }
 }
 
+/* ===== バイナリパケット送出（TEXT_MODE=0 時のみ使用）===== */
+#if TEXT_MODE == 0
+/* 1イベント = 12バイト固定長パケットを stdio_putchar_raw() で送出する
+ *
+ * パケットフォーマット:
+ *   Byte 0   : マジックバイト1 (0xAA)
+ *   Byte 1   : マジックバイト2 (0x55)
+ *   Byte 2   : FLAGS
+ *   Byte 3   : DROP_SEQ
+ *   Byte 4-5 : ADDR (little-endian, A0-A15)
+ *   Byte 6   : DATA (D0-D7)
+ *   Byte 7   : 予約 (0x00)
+ *   Byte 8-11: タイムスタンプ (uint32_t, little-endian, μs, time_us_32() の値)
+ *
+ * 注意: stdio_putchar_raw() は USB CDC バッファに書き込む。
+ * バッファが満杯の場合はブロックする可能性があるが、バイナリモードでは
+ * それ自体がフロー制御として機能する（ホスト側が読み取る速度に依存）。
+ */
+static inline void send_binary_packet(uint16_t addr, uint8_t data, uint8_t flags, uint8_t drop_seq_val) {
+    uint32_t ts = time_us_32();
+    uint8_t pkt[12];
+    pkt[0]  = 0xAA;                    /* マジックバイト1 */
+    pkt[1]  = 0x55;                    /* マジックバイト2 */
+    pkt[2]  = flags;                   /* FLAGS */
+    pkt[3]  = drop_seq_val;            /* DROP_SEQ */
+    pkt[4]  = (uint8_t)(addr & 0xFF);  /* ADDR 下位バイト */
+    pkt[5]  = (uint8_t)(addr >> 8);    /* ADDR 上位バイト */
+    pkt[6]  = data;                    /* DATA */
+    pkt[7]  = 0x00;                    /* 予約 */
+    pkt[8]  = (uint8_t)(ts        );   /* タイムスタンプ byte0 */
+    pkt[9]  = (uint8_t)(ts >>  8  );   /* タイムスタンプ byte1 */
+    pkt[10] = (uint8_t)(ts >> 16  );   /* タイムスタンプ byte2 */
+    pkt[11] = (uint8_t)(ts >> 24  );   /* タイムスタンプ byte3 */
+    /* stdio_put_bytes_raw() は Pico SDK に存在しないため、1バイトずつ送出する */
+    for (int i = 0; i < 12; i++) {
+        stdio_putchar_raw(pkt[i]);
+    }
+}
+#endif
+
 /* ===== メイン ===== */
 int main(void) {
     stdio_init_all();
     sleep_ms(250);
+#if TEXT_MODE == 1
     printf("msx_bus_logger: 起動（セーフモード）\n");
+#endif
     enter_safe_state();
 
     pio_init_logger();
+#if TEXT_MODE == 1
     printf("[SETUP] pio_init_logger() 完了\n");
+#endif
 
     dma_init_logger_with_ring_enabled(pio, sm);
+#if TEXT_MODE == 1
     printf("[SETUP] dma_init_logger_with_ring_enabled() 完了\n");
+#endif
 
     __atomic_store_n(&cpu_read_count, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&dma_write_count, 0u, __ATOMIC_RELEASE);
@@ -238,7 +287,9 @@ int main(void) {
     log_wr_idx = __atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE) & LOG_BUF_MASK;
 
     logger_armed = true;
+#if TEXT_MODE == 1
     printf("[START] メインループ開始\n");
+#endif
 
     const uint32_t status_interval_ms = 1000;
     uint32_t last_status_ms = now_ms();
@@ -271,10 +322,11 @@ int main(void) {
                 led_mode = LED_BLINK_SLOW;
             }
 
+#if TEXT_MODE == 1
             printf("[STATUS] w=%u r=%u pending=%u rate=%.1f w/s drop_seq=%u led=%s\n",
                    (unsigned)w, (unsigned)r, (unsigned)pending, rate_wps, (unsigned)drop_seq,
                    led_mode == LED_OFF ? "OFF" : led_mode == LED_BLINK_SLOW ? "SLOW" : "FAST");
-
+#endif
             last_write_count = w;
             last_status_ms   = now;
         }
@@ -309,7 +361,8 @@ int main(void) {
             log_buf64[log_wr_idx & LOG_BUF_MASK] = pack;
             log_wr_idx++;
 
-            /* USB Serial にテキスト出力（デバッグ用）
+#if TEXT_MODE == 1
+            /* テキストモード: printf でイベントを出力
              * アクセス種別ラベル: IO（/IORQ）を最優先、次に RD、WR の順 */
             const char *label = (flags & (1 << 2)) ? "IO"
                                : (flags & (1 << 0)) ? "RD"
@@ -321,9 +374,14 @@ int main(void) {
             } else {
                 printf("%s A=%04X D=%02X F=%02X\n", label, addr, data, flags);
             }
+#else
+            /* バイナリモード: 12バイトパケットを送出 */
+            send_binary_packet(addr, data, flags, drop_seq);
+#endif
         }
 
-        /* 'c' キーで DROP フラグをリセット */
+        /* 'c' キーで DROP フラグをリセット（テキストモード時のみ） */
+#if TEXT_MODE == 1
         int ch = getchar_timeout_us(0);
         if (ch == 'c') {
             drop_latched = false;
@@ -333,6 +391,7 @@ int main(void) {
             led_mode     = LED_OFF;
             printf("[CMD] drop_latched をクリア\n");
         }
+#endif
 
         tight_loop_contents();
     }
