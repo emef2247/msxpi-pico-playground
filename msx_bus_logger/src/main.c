@@ -150,7 +150,11 @@ void pio_init_logger(void) {
     sm_config_set_jmp_pin(&c1, PIN_SLTSL);
     sm_config_set_in_shift(&c1, true, false, 32);
 
-    /* GPIO0-23 は SM0 の初期化で設定済みのため再設定不要 */
+    /* GPIO0-23 は SM0 の初期化で設定済み
+     * /SLTSL（GPIO27）は SM1 の wait/jmp_pin として使用するため PIO に追加する */
+    pio_gpio_init(pio, PIN_SLTSL);
+    pio_sm_set_consecutive_pindirs(pio, sm1, PIN_SLTSL, 1, false);
+
     pio_sm_init(pio, sm1, offset1, &c1);
     pio_sm_set_enabled(pio, sm1, true);
 
@@ -304,10 +308,11 @@ static void update_led(uint32_t now_ms_val) {
  *   Byte 3   : DROP_SEQ
  *   Byte 4-5 : ADDR (little-endian, A0-A15)
  *   Byte 6   : DATA (D0-D7)
- *   Byte 7   : 予約 (0x00)
+ *   Byte 7   : SLTSL_RAW（bit0: GPIO27生値、0=Low=アサート、1=High=非アサート）
  *   Byte 8-11: タイムスタンプ (uint32_t, little-endian, μs, time_us_32() の値)
  */
-static inline void enqueue_packet(uint16_t addr, uint8_t data, uint8_t flags, uint8_t drop_seq_val) {
+static inline void enqueue_packet(uint16_t addr, uint8_t data, uint8_t flags,
+                                   uint8_t drop_seq_val, uint8_t sltsl_raw) {
     uint32_t wr = __atomic_load_n(&tx_wr, __ATOMIC_ACQUIRE);
     uint32_t rd = __atomic_load_n(&tx_rd, __ATOMIC_ACQUIRE);
 
@@ -328,7 +333,7 @@ static inline void enqueue_packet(uint16_t addr, uint8_t data, uint8_t flags, ui
     pkt[4]  = (uint8_t)(addr & 0xFF);  /* ADDR 下位バイト */
     pkt[5]  = (uint8_t)(addr >> 8);    /* ADDR 上位バイト */
     pkt[6]  = data;                    /* DATA */
-    pkt[7]  = 0x00;                    /* 予約 */
+    pkt[7]  = sltsl_raw & 0x01u;       /* SLTSL_RAW: bit0=GPIO27生値（0=Low=アサート、1=High） */
     pkt[8]  = (uint8_t)(ts        );   /* タイムスタンプ byte0 */
     pkt[9]  = (uint8_t)(ts >>  8  );   /* タイムスタンプ byte1 */
     pkt[10] = (uint8_t)(ts >> 16  );   /* タイムスタンプ byte2 */
@@ -462,9 +467,12 @@ int main(void) {
             }
 
 #if TEXT_MODE == 1
-            printf("[STATUS] w=%u r=%u pending=%u rate=%.1f w/s drop_seq=%u led=%s\n",
+            /* /SLTSL の現在値を読み取り（H=High=非アサート、L=Low=アサート） */
+            bool sltsl_now = gpio_get(PIN_SLTSL);
+            printf("[STATUS] w=%u r=%u pending=%u rate=%.1f w/s drop_seq=%u led=%s SLTSL=%c\n",
                    (unsigned)w, (unsigned)r, (unsigned)pending, rate_wps, (unsigned)drop_seq,
-                   led_mode == LED_OFF ? "OFF" : led_mode == LED_BLINK_SLOW ? "SLOW" : "FAST");
+                   led_mode == LED_OFF ? "OFF" : led_mode == LED_BLINK_SLOW ? "SLOW" : "FAST",
+                   sltsl_now ? 'H' : 'L');
 #endif
             last_write_count = w;
             last_status_ms   = now;
@@ -485,6 +493,7 @@ int main(void) {
             uint16_t addr  = extract_addr(raw);
             uint8_t  data  = extract_data(raw);
             uint8_t  flags = make_flags(raw, false);
+            uint8_t  sltsl_raw = (uint8_t)((raw >> 27) & 1u);  /* GPIO27 生値を抽出 */
 
 #if TEXT_MODE == 1
             /* テキストモード: printf でイベントを出力
@@ -495,16 +504,19 @@ int main(void) {
                                    : (flags & (1 << 1)) ? "WR"
                                    : "--";
                 if (drop_latched) {
-                    printf("%s A=%04X D=%02X F=%02X [DROP seq=%u]\n",
-                           label, addr, data, flags, (unsigned)drop_seq);
+                    printf("%s A=%04X D=%02X F=%02X SLTSL=%c [DROP seq=%u]\n",
+                           label, addr, data, flags,
+                           sltsl_raw ? 'H' : 'L', (unsigned)drop_seq);
                 } else {
-                    printf("%s A=%04X D=%02X F=%02X\n", label, addr, data, flags);
+                    printf("%s A=%04X D=%02X F=%02X SLTSL=%c\n",
+                           label, addr, data, flags,
+                           sltsl_raw ? 'H' : 'L');
                 }
             }
 #else
             /* バイナリモード: TXリングバッファにパケットをエンキュー */
             if (PASS_IO(addr)) {
-                enqueue_packet(addr, data, flags, drop_seq);
+                enqueue_packet(addr, data, flags, drop_seq, sltsl_raw);
             }
 #endif
         }
@@ -522,21 +534,25 @@ int main(void) {
             uint16_t addr  = extract_addr(raw);
             uint8_t  data  = extract_data(raw);
             uint8_t  flags = make_flags(raw, true);
+            uint8_t  sltsl_raw = (uint8_t)((raw >> 27) & 1u);  /* GPIO27 生値を抽出（/SLTSLはPIOトリガ時Lowのため通常0） */
 
 #if TEXT_MODE == 1
             /* テキストモード: MEM アクセスを printf で出力 */
             if (PASS_MEM(addr)) {
                 if (drop_latched) {
-                    printf("MEM A=%04X D=%02X F=%02X [DROP seq=%u]\n",
-                           addr, data, flags, (unsigned)drop_seq);
+                    printf("MEM A=%04X D=%02X F=%02X SLTSL=%c [DROP seq=%u]\n",
+                           addr, data, flags,
+                           sltsl_raw ? 'H' : 'L', (unsigned)drop_seq);
                 } else {
-                    printf("MEM A=%04X D=%02X F=%02X\n", addr, data, flags);
+                    printf("MEM A=%04X D=%02X F=%02X SLTSL=%c\n",
+                           addr, data, flags,
+                           sltsl_raw ? 'H' : 'L');
                 }
             }
 #else
             /* バイナリモード: TXリングバッファにパケットをエンキュー */
             if (PASS_MEM(addr)) {
-                enqueue_packet(addr, data, flags, drop_seq);
+                enqueue_packet(addr, data, flags, drop_seq, sltsl_raw);
             }
 #endif
         }
