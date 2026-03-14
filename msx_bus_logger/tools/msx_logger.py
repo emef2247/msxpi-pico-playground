@@ -143,7 +143,10 @@ def sync_to_magic(ser, raw_file=None):
             raw_file.write(b)
 
 
-def receive_loop(ser, csv_writer, raw_file, warn_drop):
+VDP_IO_ADDRS = {0x98, 0x99, 0x9A, 0x9B}
+
+
+def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename=''):
     """メイン受信ループ
 
     パケットを受信してCSV書き込みおよびコンソール表示を行う。
@@ -151,6 +154,14 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop):
     """
     seq = 0
     drop_count = 0
+    count_io = 0
+    count_sltsl = 0
+    count_vdp_rd = 0
+    count_vdp_wr = 0
+    last_drop_seq = 0
+    peak_rate = 0.0
+    window_start_us = None
+    window_count = 0
     start_time = time.time()
 
     try:
@@ -187,6 +198,40 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop):
                     file=sys.stderr
                 )
 
+            # IOアクセス集計
+            if io:
+                count_io += 1
+                addr_lo = addr & 0xFF
+                if addr_lo in VDP_IO_ADDRS:
+                    if rd:
+                        count_vdp_rd += 1
+                    else:
+                        count_vdp_wr += 1
+
+            # SLTSLアクセス集計（将来拡張用）
+            # io==0 かつ rd または wr がアサートされている場合のみMEM候補としてカウント
+            if not io and (rd or wr):
+                count_sltsl += 1
+
+            # peak rate 計測（1秒ウィンドウ）
+            if window_start_us is None:
+                window_start_us = timestamp
+                window_count = 1
+            else:
+                # uint32_t オーバーフロー対応: Python の整数マスクで正しく差分を計算する
+                # 例: timestamp=100, window_start_us=0xFFFFFF00 → (100 - 0xFFFFFF00) & 0xFFFFFFFF ≈ 356us
+                elapsed_us = (timestamp - window_start_us) & 0xFFFFFFFF
+                if elapsed_us >= 1_000_000:
+                    window_rate = window_count / (elapsed_us / 1_000_000)
+                    if window_rate > peak_rate:
+                        peak_rate = window_rate
+                    window_start_us = timestamp
+                    window_count = 1
+                else:
+                    window_count += 1
+
+            last_drop_seq = drop_seq
+
             # CSVへの書き込み
             csv_writer.writerow([
                 seq,
@@ -210,11 +255,20 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop):
         # Ctrl+C 終了時のサマリ出力
         elapsed = time.time() - start_time
         rate = seq / elapsed if elapsed > 0 else 0.0
+        throughput_kbps = (seq * PACKET_SIZE) / elapsed / 1024 if elapsed > 0 else 0.0
         print('\n=== 受信サマリ ===')
         print(f'受信イベント数   : {seq}')
+        print(f'  うち /IORQ Low（IOアクセス）: {count_io}')
+        print(f'    VDP RD (0x98-0x9B)      : {count_vdp_rd}')
+        print(f'    VDP WR (0x98-0x9B)      : {count_vdp_wr}')
+        print(f'  うち /SLTSL Low（MEM候補）  : {count_sltsl}')
         print(f'DROPラッチ検出数 : {drop_count}')
+        print(f'実DROPシーケンス数: {last_drop_seq}')
         print(f'経過時間        : {elapsed:.1f} 秒')
         print(f'平均レート      : {rate:.1f} events/sec')
+        print(f'ピークレート    : {peak_rate:.1f} events/sec')
+        print(f'スループット    : {throughput_kbps:.1f} KB/sec')
+        print(f'保存先(CSV)     : {csv_filename}')
 
 
 def main():
@@ -254,7 +308,7 @@ def main():
                 ])
 
                 # 受信ループ実行
-                receive_loop(ser, csv_writer, raw_file_ctx, args.warn_drop)
+                receive_loop(ser, csv_writer, raw_file_ctx, args.warn_drop, csv_filename)
 
             finally:
                 if raw_file_ctx:
