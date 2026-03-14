@@ -44,7 +44,7 @@
 
 /* ===== 設定 ===== */
 /* 1: printfテキスト出力（デバッグ用）、0: バイナリ転送（本番用） */
-#define TEXT_MODE 1
+#define TEXT_MODE 0
 
 #define DMA_BLOCK_WORDS 512   /* 128 から増加: DMA IRQ 過多によるDROP防止 */
 #define LOG_ENTRIES (8 * 1024)
@@ -250,11 +250,16 @@ static inline void send_binary_packet(uint16_t addr, uint8_t data, uint8_t flags
     pkt[9]  = (uint8_t)(ts >>  8  );   /* タイムスタンプ byte1 */
     pkt[10] = (uint8_t)(ts >> 16  );   /* タイムスタンプ byte2 */
     pkt[11] = (uint8_t)(ts >> 24  );   /* タイムスタンプ byte3 */
-    /* stdio_put_bytes_raw() は Pico SDK に存在しないため、1バイトずつ送出する */
-    for (int i = 0; i < 12; i++) {
-        stdio_putchar_raw(pkt[i]);
-    }
+	
+	/* USB CDC に接続されていない場合は送信をスキップ */
+    if (!stdio_usb_connected()) return;
+	
+    /* 1バイトずつではなく12バイト一括 */
+	fwrite(pkt, 1, 12, stdout);
+	fflush(stdout);
 }
+
+
 #endif
 
 /* ===== メイン ===== */
