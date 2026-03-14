@@ -4,6 +4,7 @@
 #include "hardware/timer.h"
 #include "hardware/pio.h"
 #include "hardware/dma.h"
+#include "pico/multicore.h"   /* multicore_launch_core1() に必要 */
 
 #include "msx_bus_logger.pio.h"
 
@@ -68,17 +69,25 @@ volatile uint32_t dma_write_count = 0;
 volatile uint32_t cpu_read_count = 0;
 
 uint32_t dma_raw_buf[LOG_ENTRIES];
-uint64_t log_buf64[LOG_ENTRIES]; /* 将来のバイナリ転送に備えて保持 */
 
 volatile uint32_t dma_wr_idx = 0;
-volatile uint32_t log_wr_idx = 0;
 
 static bool drop_latched = false;
 static uint8_t drop_seq = 0;
 static bool dma_lag = false;
 
 volatile bool logger_armed = false;
-volatile uint32_t dma_irq_time_us;
+
+/* TXリングバッファ: core0が書き込み、core1が読み出す */
+#if TEXT_MODE == 0
+#define TX_RING_PACKETS 1024                        /* 1024パケット × 12バイト = 12KB */
+#define TX_RING_SIZE    (TX_RING_PACKETS * 12)
+
+static uint8_t   tx_ring[TX_RING_SIZE];             /* パケットバッファ本体 */
+static volatile uint32_t tx_wr = 0;                 /* core0が書き込むインデックス（パケット単位） */
+static volatile uint32_t tx_rd = 0;                 /* core1が読み出すインデックス（パケット単位） */
+static volatile uint32_t tx_drop_count = 0;         /* TXバッファ溢れカウント */
+#endif
 
 /* LED 状態 */
 static LedMode  led_mode           = LED_OFF;
@@ -130,7 +139,6 @@ void pio_init_logger(void) {
 }
 
 void __isr dma_handler(void) {
-    dma_irq_time_us = time_us_32();
     dma_hw->ints0 = 1u << dma_chan;
 
     /* dma_wr_idx を進めてからリングバッファの次のブロック先頭を書き込み先にセット */
@@ -217,9 +225,10 @@ static void update_led(uint32_t now_ms_val) {
     }
 }
 
-/* ===== バイナリパケット送出（TEXT_MODE=0 時のみ使用）===== */
+/* ===== TXリングバッファへの書き込みとcore1 USB送信（TEXT_MODE=0 時のみ）===== */
 #if TEXT_MODE == 0
-/* 1イベント = 12バイト固定長パケットを stdio_putchar_raw() で送出する
+
+/* core0: パケット組み立てとTXリングバッファへの書き込み
  *
  * パケットフォーマット:
  *   Byte 0   : マジックバイト1 (0xAA)
@@ -230,14 +239,21 @@ static void update_led(uint32_t now_ms_val) {
  *   Byte 6   : DATA (D0-D7)
  *   Byte 7   : 予約 (0x00)
  *   Byte 8-11: タイムスタンプ (uint32_t, little-endian, μs, time_us_32() の値)
- *
- * 注意: stdio_putchar_raw() は USB CDC バッファに書き込む。
- * バッファが満杯の場合はブロックする可能性があるが、バイナリモードでは
- * それ自体がフロー制御として機能する（ホスト側が読み取る速度に依存）。
  */
-static inline void send_binary_packet(uint16_t addr, uint8_t data, uint8_t flags, uint8_t drop_seq_val) {
+static inline void enqueue_packet(uint16_t addr, uint8_t data, uint8_t flags, uint8_t drop_seq_val) {
+    uint32_t wr = __atomic_load_n(&tx_wr, __ATOMIC_ACQUIRE);
+    uint32_t rd = __atomic_load_n(&tx_rd, __ATOMIC_ACQUIRE);
+
+    if (wr - rd >= TX_RING_PACKETS) {
+        /* TXバッファ溢れ: DROP としてカウントしてスキップ */
+        __atomic_fetch_add(&tx_drop_count, 1u, __ATOMIC_RELAXED);
+        return;
+    }
+
     uint32_t ts = time_us_32();
-    uint8_t pkt[12];
+    uint32_t idx = wr & (TX_RING_PACKETS - 1u);  /* TX_RING_PACKETS は2のべき乗 */
+    uint8_t *pkt = &tx_ring[idx * 12];
+
     pkt[0]  = 0xAA;                    /* マジックバイト1 */
     pkt[1]  = 0x55;                    /* マジックバイト2 */
     pkt[2]  = flags;                   /* FLAGS */
@@ -250,15 +266,37 @@ static inline void send_binary_packet(uint16_t addr, uint8_t data, uint8_t flags
     pkt[9]  = (uint8_t)(ts >>  8  );   /* タイムスタンプ byte1 */
     pkt[10] = (uint8_t)(ts >> 16  );   /* タイムスタンプ byte2 */
     pkt[11] = (uint8_t)(ts >> 24  );   /* タイムスタンプ byte3 */
-	
-	/* USB CDC に接続されていない場合は送信をスキップ */
-    if (!stdio_usb_connected()) return;
-	
-    /* 1バイトずつではなく12バイト一括 */
-	fwrite(pkt, 1, 12, stdout);
-	fflush(stdout);
+
+    __atomic_store_n(&tx_wr, wr + 1u, __ATOMIC_RELEASE);
 }
 
+/* core1メイン: TXリングバッファからパケットをUSB送信する */
+void core1_usb_sender(void) {
+    while (1) {
+        uint32_t rd = __atomic_load_n(&tx_rd, __ATOMIC_ACQUIRE);
+        uint32_t wr = __atomic_load_n(&tx_wr, __ATOMIC_ACQUIRE);
+
+        if (rd == wr) {
+            /* 送信待ちなし: tight_loop_contents() でビジーウェイト
+             * （USB送信は割り込みではなくポーリングのため WFI は使用しない） */
+            tight_loop_contents();
+            continue;
+        }
+
+        /* TXリングバッファからパケットを取り出す */
+        uint32_t idx = rd & (TX_RING_PACKETS - 1u);  /* TX_RING_PACKETS は2のべき乗 */
+        uint8_t *pkt = &tx_ring[idx * 12];
+
+        if (stdio_usb_connected()) {
+            /* USB接続中: 12バイト一括送信 */
+            fwrite(pkt, 1, 12, stdout);
+            fflush(stdout);
+        }
+        /* 未接続時もインデックスを進めてバッファを解放する（読み捨て） */
+
+        __atomic_store_n(&tx_rd, rd + 1u, __ATOMIC_RELEASE);
+    }
+}
 
 #endif
 
@@ -289,7 +327,11 @@ int main(void) {
     logger_armed = false;
 
     __atomic_store_n(&cpu_read_count, __atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
-    log_wr_idx = __atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE) & LOG_BUF_MASK;
+
+#if TEXT_MODE == 0
+    /* core1 を USB送信ループとして起動 */
+    multicore_launch_core1(core1_usb_sender);
+#endif
 
     logger_armed = true;
 #if TEXT_MODE == 1
@@ -350,22 +392,6 @@ int main(void) {
             uint8_t  data  = extract_data(raw);
             uint8_t  flags = make_flags(raw);
 
-            /* log_buf64 パック形式:
-             * [63:56] FLAGS
-             * [55:48] DROP_SEQ
-             * [47:32] ADDR (A0-A15)
-             * [31:16] DATA (D0-D7、上位8bitは0)
-             * [15:0]  タイムスタンプ下位16bit（dma_irq_time_us & 0xFFFF）
-             */
-            uint32_t ts = __atomic_load_n(&dma_irq_time_us, __ATOMIC_ACQUIRE);
-            uint64_t pack = ((uint64_t)flags                     << 56)
-                          | ((uint64_t)drop_seq                  << 48)
-                          | ((uint64_t)addr                      << 32)
-                          | ((uint64_t)data                      << 16)
-                          | ((uint64_t)(ts & 0xFFFF)                  );
-            log_buf64[log_wr_idx & LOG_BUF_MASK] = pack;
-            log_wr_idx++;
-
 #if TEXT_MODE == 1
             /* テキストモード: printf でイベントを出力
              * アクセス種別ラベル: IO（/IORQ）を最優先、次に RD、WR の順 */
@@ -380,8 +406,8 @@ int main(void) {
                 printf("%s A=%04X D=%02X F=%02X\n", label, addr, data, flags);
             }
 #else
-            /* バイナリモード: 12バイトパケットを送出 */
-            send_binary_packet(addr, data, flags, drop_seq);
+            /* バイナリモード: TXリングバッファにパケットをエンキュー */
+            enqueue_packet(addr, data, flags, drop_seq);
 #endif
         }
 
