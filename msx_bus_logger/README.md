@@ -9,8 +9,6 @@ Use at your own risk.
 ## Projects
 
 ### msx_bus_logger — MSX Bus Logger
-
-Picoの使い方を勉強するためのプロジェクトです。
 MSXpi（Raspberry Pi Pico ベースの MSX カートリッジ）とピン互換のハードを使って、MSX の IO バスアクセスをリアルタイムにキャプチャ・記録します
 
 PIO（Programmable IO）と DMA を活用し、Z80 のバスサイクルを取りこぼしなくキャプチャします。
