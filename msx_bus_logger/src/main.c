@@ -361,8 +361,8 @@ int main(void) {
             uint8_t delta_drop = (uint8_t)(drop_seq - last_drop_seq);
             last_drop_seq = drop_seq;
 
-            if (!drop_latched) {
-                led_mode = LED_OFF;
+            if (delta_drop == 0) {
+                led_mode = LED_OFF;        /* 直近1秒でDROPなし → 完全消灯 */
             } else if (delta_drop >= 10) {
                 led_mode = LED_BLINK_FAST;
             } else {
