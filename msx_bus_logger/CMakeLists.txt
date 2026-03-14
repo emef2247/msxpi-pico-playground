@@ -23,6 +23,7 @@ target_include_directories(msx_bus_logger PRIVATE
 
 target_link_libraries(msx_bus_logger
     pico_stdlib
+    pico_multicore
     hardware_timer
     hardware_pio
     hardware_dma

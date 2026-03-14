@@ -1,16 +1,23 @@
+; MSXバスロガー PIO プログラム（アドレス+データ同時サンプリング版）
+;
+; 設定（C側）:
+;   in_base  = GPIO0 (PIN_A0)
+;   jmp_pin  = GPIO26 (/IORQ)
+;   in_shift = 左シフト、autopush 無効、threshold=32
+;
+; ISR ビット配置（in pins, 32、in_base=GPIO0）:
+;   [15:0]  = A0-A15  (GPIO0-15)  : アドレスバス
+;   [23:16] = D0-D7   (GPIO16-23) : データバス
+;   [24]    = /RD     (GPIO24)    : Low=アサート
+;   [25]    = /WR     (GPIO25)    : Low=アサート
+;   [26]    = /IORQ   (GPIO26)    : Low=アサート（サンプル時は常にLow）
+;   [31:27] = 未使用  (GPIO27-31)
+
 .program msx_bus_logger
 
-; jmp pin = /IORQ (active low)
-; in pins = D0-D7 (8bit)
-
-; bit 0–7   = D0–D7   (GPIO 16–23)
-; bit 8     = RD      (GPIO 24)
-; bit 9     = WR      (GPIO 25)
-; bit 10    = IORQ    (GPIO 26)
-
 loop:
-    wait 0 pin 0      ; /IORQ が Low（jmp pin = pin 0）
-    in   pins, 11     ; GPIO16(D0)から 26(IORQ)までの連続した11本を一気に取得
-    push block        ; FIFO へ
-    wait 1 pin 0      ; /IORQ が High に戻るまで待つ
+    wait 0 gpio 26          ; /IORQ がLow（GPIO26）になるまで待つ
+    in   pins, 32           ; GPIO0-31 を ISR に一括取り込む（アドレス+データ+制御線）
+    push block              ; ISR（32bit）を RX FIFO へ手動プッシュ
+    wait 1 gpio 26          ; /IORQ がHighに戻るまで待つ
     jmp  loop
