@@ -17,6 +17,10 @@ pico_generate_pio_header(msx_bus_logger
     ${CMAKE_CURRENT_LIST_DIR}/src/msx_bus_logger.pio
 )
 
+pico_generate_pio_header(msx_bus_logger
+    ${CMAKE_CURRENT_LIST_DIR}/src/msx_bus_logger_mem.pio
+)
+
 target_include_directories(msx_bus_logger PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
 )

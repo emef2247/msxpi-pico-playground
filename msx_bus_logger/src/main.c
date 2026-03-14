@@ -7,6 +7,7 @@
 #include "pico/multicore.h"   /* multicore_launch_core1() に必要 */
 
 #include "msx_bus_logger.pio.h"
+#include "msx_bus_logger_mem.pio.h"
 
 /* ピン配置 : https://github.com/piigaa-densetu-two-dai/MSXpi/blob/main/MSX%CF%80.pdf */
 
@@ -60,17 +61,24 @@ typedef enum {
 
 /* ===== グローバル変数 ===== */
 PIO pio = pio0;
-uint sm = 0;
-int dma_chan;
+uint sm  = 0;   /* IO アクセス用 SM（/IORQ） */
+uint sm1 = 1;   /* MEM アクセス用 SM（/SLTSL） */
+int dma_chan;         /* SM0（IO）用 DMA チャネル */
+int dma_chan_mem;     /* SM1（MEM）用 DMA チャネル */
 dma_channel_config dma_cfg;
+dma_channel_config dma_cfg_mem;
 
 /* カウンタ */
-volatile uint32_t dma_write_count = 0;
-volatile uint32_t cpu_read_count = 0;
+volatile uint32_t dma_write_count     = 0;  /* SM0 DMA書き込みカウント */
+volatile uint32_t dma_write_count_mem = 0;  /* SM1 DMA書き込みカウント */
+volatile uint32_t cpu_read_count      = 0;  /* SM0 CPU読み取りカウント */
+volatile uint32_t cpu_read_count_mem  = 0;  /* SM1 CPU読み取りカウント */
 
-uint32_t dma_raw_buf[LOG_ENTRIES];
+uint32_t dma_raw_buf[LOG_ENTRIES];      /* SM0（IO）用 DMAバッファ */
+uint32_t dma_raw_buf_mem[LOG_ENTRIES];  /* SM1（MEM）用 DMAバッファ */
 
-volatile uint32_t dma_wr_idx = 0;
+volatile uint32_t dma_wr_idx     = 0;  /* SM0 DMAバッファ書き込みインデックス */
+volatile uint32_t dma_wr_idx_mem = 0;  /* SM1 DMAバッファ書き込みインデックス */
 
 static bool drop_latched = false;
 static uint8_t drop_seq = 0;
@@ -111,6 +119,7 @@ void enter_safe_state(void) {
 }
 
 void pio_init_logger(void) {
+    /* SM0: /IORQ（IOアクセス）*/
     uint offset = pio_add_program(pio, &msx_bus_logger_program);
     pio_sm_config c = msx_bus_logger_program_get_default_config(offset);
 
@@ -131,6 +140,19 @@ void pio_init_logger(void) {
 
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
+
+    /* SM1: /SLTSL（メモリアクセス）*/
+    uint offset1 = pio_add_program(pio, &msx_bus_logger_mem_program);
+    pio_sm_config c1 = msx_bus_logger_mem_program_get_default_config(offset1);
+
+    /* SM0 と同じ in_base・in_shift 設定 */
+    sm_config_set_in_pins(&c1, PIN_A0);
+    sm_config_set_jmp_pin(&c1, PIN_SLTSL);
+    sm_config_set_in_shift(&c1, true, false, 32);
+
+    /* GPIO0-23 は SM0 の初期化で設定済みのため再設定不要 */
+    pio_sm_init(pio, sm1, offset1, &c1);
+    pio_sm_set_enabled(pio, sm1, true);
 
     /* オンボードLED初期化 */
     gpio_init(PICO_DEFAULT_LED_PIN);
@@ -180,6 +202,50 @@ void dma_init_logger_with_ring_enabled(PIO pio, uint sm) {
     dma_start_channel_mask(1u << dma_chan);
 }
 
+/* SM1（MEM）用 DMA 割り込みハンドラ（DMA_IRQ_1） */
+void __isr dma_handler_mem(void) {
+    dma_hw->ints1 = 1u << dma_chan_mem;
+
+    /* dma_wr_idx_mem を進めてからリングバッファの次のブロック先頭を書き込み先にセット */
+    dma_wr_idx_mem += DMA_BLOCK_WORDS;
+    dma_write_count_mem = dma_wr_idx_mem;
+
+    dma_channel_set_read_addr(dma_chan_mem, &pio->rxf[sm1], false);
+    dma_channel_set_write_addr(dma_chan_mem, &dma_raw_buf_mem[dma_wr_idx_mem & LOG_BUF_MASK], true);
+
+    if (!logger_armed) return;
+
+    /* DROP 検出（リングバッファのオーバーラン） */
+    uint32_t pending = dma_write_count_mem - cpu_read_count_mem;
+    if (pending > LOG_ENTRIES) {
+        dma_lag = true;
+        drop_latched = true;
+        drop_seq++;
+    }
+}
+
+/* SM1（MEM）用 DMA の初期化（DMA_IRQ_1 を使用） */
+void dma_init_logger_mem(PIO pio_, uint sm_) {
+    dma_chan_mem = dma_claim_unused_channel(true);
+    dma_cfg_mem = dma_channel_get_default_config(dma_chan_mem);
+
+    channel_config_set_transfer_data_size(&dma_cfg_mem, DMA_SIZE_32);
+    channel_config_set_dreq(&dma_cfg_mem, pio_get_dreq(pio_, sm_, false));
+    channel_config_set_read_increment(&dma_cfg_mem, false);
+    channel_config_set_write_increment(&dma_cfg_mem, true);
+    channel_config_set_chain_to(&dma_cfg_mem, dma_chan_mem); /* 自身へのチェーン（チェーン無効） */
+
+    dma_channel_configure(dma_chan_mem, &dma_cfg_mem,
+                          dma_raw_buf_mem, &pio_->rxf[sm_],
+                          DMA_BLOCK_WORDS, false);
+
+    dma_channel_set_irq1_enabled(dma_chan_mem, true);
+    irq_set_exclusive_handler(DMA_IRQ_1, dma_handler_mem);
+    irq_set_enabled(DMA_IRQ_1, true);
+
+    dma_start_channel_mask(1u << dma_chan_mem);
+}
+
 /* PIO raw 値からアドレスを取り出す
  * ISR[15:0] = GPIO0-15 = A0-A15 */
 static inline uint16_t extract_addr(uint32_t raw) {
@@ -193,14 +259,16 @@ static inline uint8_t extract_data(uint32_t raw) {
 }
 
 /* FLAGS バイトを生成する
- * ISR[24] = /RD  (GPIO24) : Low=アサート
- * ISR[25] = /WR  (GPIO25) : Low=アサート
- * ISR[26] = /IORQ(GPIO26) : Low=アサート */
-static inline uint8_t make_flags(uint32_t raw) {
+ * ISR[24] = /RD   (GPIO24) : Low=アサート
+ * ISR[25] = /WR   (GPIO25) : Low=アサート
+ * ISR[26] = /IORQ (GPIO26) : Low=アサート
+ * is_mem  = true  のとき MEM フラグ（bit3）をセット */
+static inline uint8_t make_flags(uint32_t raw, bool is_mem) {
     uint8_t f = 0;
     if (!(raw & (1u << 24))) f |= 1 << 0; /* /RD がアサート → RD フラグ */
     if (!(raw & (1u << 25))) f |= 1 << 1; /* /WR がアサート → WR フラグ */
     if (!(raw & (1u << 26))) f |= 1 << 2; /* /IORQ がアサート → IO フラグ */
+    if (is_mem)              f |= 1 << 3; /* MEM アクセス（/SLTSL） */
     if (drop_latched)        f |= 1 << 4; /* DROP ラッチフラグ */
     if (dma_lag)             f |= 1 << 6; /* DMA 遅延フラグ */
     return f;
@@ -227,7 +295,6 @@ static void update_led(uint32_t now_ms_val) {
 
 /* ===== TXリングバッファへの書き込みとcore1 USB送信（TEXT_MODE=0 時のみ）===== */
 #if TEXT_MODE == 0
-
 /* core0: パケット組み立てとTXリングバッファへの書き込み
  *
  * パケットフォーマット:
@@ -300,6 +367,23 @@ void core1_usb_sender(void) {
 
 #endif
 
+/* ===== Picoフィルタ設定（DROP発生時の最終手段）===== */
+/* デフォルトはすべて無効（全記録）。DROPが発生した場合のみ有効化してリビルドする */
+
+/* IO アクセスフィルタ */
+#define FILTER_IO_ENABLE  0         /* 0=無効（全記録）、1=有効 */
+#define FILTER_IO_MIN     0x0000u   /* 記録するアドレス下限（有効時） */
+#define FILTER_IO_MAX     0x00FFu   /* 記録するアドレス上限（有効時） */
+
+/* MEM アクセスフィルタ */
+#define FILTER_MEM_ENABLE 0         /* 0=無効（全記録）、1=有効 */
+#define FILTER_MEM_MIN    0x4000u   /* 記録するアドレス下限（有効時） */
+#define FILTER_MEM_MAX    0x7FFFu   /* 記録するアドレス上限（有効時） */
+
+/* フィルタ判定マクロ（ENABLE=0 の場合は常に true） */
+#define PASS_IO(addr)  (!FILTER_IO_ENABLE  || ((addr) >= FILTER_IO_MIN  && (addr) <= FILTER_IO_MAX))
+#define PASS_MEM(addr) (!FILTER_MEM_ENABLE || ((addr) >= FILTER_MEM_MIN && (addr) <= FILTER_MEM_MAX))
+
 /* ===== メイン ===== */
 int main(void) {
     stdio_init_all();
@@ -319,14 +403,22 @@ int main(void) {
     printf("[SETUP] dma_init_logger_with_ring_enabled() 完了\n");
 #endif
 
+    dma_init_logger_mem(pio, sm1);
+#if TEXT_MODE == 1
+    printf("[SETUP] dma_init_logger_mem() 完了\n");
+#endif
+
     __atomic_store_n(&cpu_read_count, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&dma_write_count, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&cpu_read_count_mem, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&dma_write_count_mem, 0u, __ATOMIC_RELEASE);
     drop_seq = 0;
     dma_lag = false;
     drop_latched = false;
     logger_armed = false;
 
     __atomic_store_n(&cpu_read_count, __atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+    __atomic_store_n(&cpu_read_count_mem, __atomic_load_n(&dma_write_count_mem, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
 
 #if TEXT_MODE == 0
     /* core1 を USB送信ループとして起動 */
@@ -379,6 +471,8 @@ int main(void) {
         }
 
         /* DMA バッファから読み出してログ出力 */
+
+        /* IO アクセス（SM0）を処理 */
         uint32_t written = __atomic_load_n(&dma_write_count, __ATOMIC_ACQUIRE);
         while (__atomic_load_n(&cpu_read_count, __ATOMIC_ACQUIRE) < written) {
             uint32_t idx = __atomic_load_n(&cpu_read_count, __ATOMIC_ACQUIRE) & LOG_BUF_MASK;
@@ -388,26 +482,62 @@ int main(void) {
                              __atomic_load_n(&cpu_read_count, __ATOMIC_ACQUIRE) + 1u,
                              __ATOMIC_RELEASE);
 
-            uint16_t addr  = extract_addr(raw);   /* PIO サンプル値からアドレスを正確に取得 */
+            uint16_t addr  = extract_addr(raw);
             uint8_t  data  = extract_data(raw);
-            uint8_t  flags = make_flags(raw);
+            uint8_t  flags = make_flags(raw, false);
 
 #if TEXT_MODE == 1
             /* テキストモード: printf でイベントを出力
              * アクセス種別ラベル: IO（/IORQ）を最優先、次に RD、WR の順 */
-            const char *label = (flags & (1 << 2)) ? "IO"
-                               : (flags & (1 << 0)) ? "RD"
-                               : (flags & (1 << 1)) ? "WR"
-                               : "--";
-            if (drop_latched) {
-                printf("%s A=%04X D=%02X F=%02X [DROP seq=%u]\n",
-                       label, addr, data, flags, (unsigned)drop_seq);
-            } else {
-                printf("%s A=%04X D=%02X F=%02X\n", label, addr, data, flags);
+            if (PASS_IO(addr)) {
+                const char *label = (flags & (1 << 2)) ? "IO"
+                                   : (flags & (1 << 0)) ? "RD"
+                                   : (flags & (1 << 1)) ? "WR"
+                                   : "--";
+                if (drop_latched) {
+                    printf("%s A=%04X D=%02X F=%02X [DROP seq=%u]\n",
+                           label, addr, data, flags, (unsigned)drop_seq);
+                } else {
+                    printf("%s A=%04X D=%02X F=%02X\n", label, addr, data, flags);
+                }
             }
 #else
             /* バイナリモード: TXリングバッファにパケットをエンキュー */
-            enqueue_packet(addr, data, flags, drop_seq);
+            if (PASS_IO(addr)) {
+                enqueue_packet(addr, data, flags, drop_seq);
+            }
+#endif
+        }
+
+        /* MEM アクセス（SM1）を処理 */
+        uint32_t written_mem = __atomic_load_n(&dma_write_count_mem, __ATOMIC_ACQUIRE);
+        while (__atomic_load_n(&cpu_read_count_mem, __ATOMIC_ACQUIRE) < written_mem) {
+            uint32_t idx = __atomic_load_n(&cpu_read_count_mem, __ATOMIC_ACQUIRE) & LOG_BUF_MASK;
+            uint32_t raw = dma_raw_buf_mem[idx];
+
+            __atomic_store_n(&cpu_read_count_mem,
+                             __atomic_load_n(&cpu_read_count_mem, __ATOMIC_ACQUIRE) + 1u,
+                             __ATOMIC_RELEASE);
+
+            uint16_t addr  = extract_addr(raw);
+            uint8_t  data  = extract_data(raw);
+            uint8_t  flags = make_flags(raw, true);
+
+#if TEXT_MODE == 1
+            /* テキストモード: MEM アクセスを printf で出力 */
+            if (PASS_MEM(addr)) {
+                if (drop_latched) {
+                    printf("MEM A=%04X D=%02X F=%02X [DROP seq=%u]\n",
+                           addr, data, flags, (unsigned)drop_seq);
+                } else {
+                    printf("MEM A=%04X D=%02X F=%02X\n", addr, data, flags);
+                }
+            }
+#else
+            /* バイナリモード: TXリングバッファにパケットをエンキュー */
+            if (PASS_MEM(addr)) {
+                enqueue_packet(addr, data, flags, drop_seq);
+            }
 #endif
         }
 

@@ -1,0 +1,24 @@
+; MSXバスロガー PIO プログラム（メモリアクセス用）
+;
+; 設定（C側）:
+;   in_base  = GPIO0 (PIN_A0)
+;   jmp_pin  = GPIO27 (/SLTSL)
+;   in_shift = 左シフト、autopush 無効、threshold=32
+;
+; ISR ビット配置（in pins, 32、in_base=GPIO0）:
+;   [15:0]  = A0-A15  (GPIO0-15)  : アドレスバス
+;   [23:16] = D0-D7   (GPIO16-23) : データバス
+;   [24]    = /RD     (GPIO24)    : Low=アサート
+;   [25]    = /WR     (GPIO25)    : Low=アサート
+;   [26]    = /IORQ   (GPIO26)    : （メモリアクセス時は通常High）
+;   [27]    = /SLTSL  (GPIO27)    : Low=アサート（サンプル時は常にLow）
+;   [31:28] = 未使用  (GPIO28-31)
+
+.program msx_bus_logger_mem
+
+loop:
+    wait 0 gpio 27          ; /SLTSL がLow（GPIO27）になるまで待つ
+    in   pins, 32           ; GPIO0-31 を ISR に一括取り込む（アドレス+データ+制御線）
+    push block              ; ISR（32bit）を RX FIFO へ手動プッシュ
+    wait 1 gpio 27          ; /SLTSL がHighに戻るまで待つ
+    jmp  loop
