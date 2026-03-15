@@ -203,7 +203,7 @@ void pio_init_logger(void) {
 
     /* in_base = GPIO0 (A0): in pins, 32 でアドレス+データ+制御線を一括取り込む */
     sm_config_set_in_pins(&c, PIN_A0);
-    sm_config_set_jmp_pin(&c, PIN_IORQ);
+    sm_config_set_jmp_pin(&c, PIN_WR); // /IORQから/WRトリガに変更。MemoryMappedIOもログ対象にするため
 
     /* 左シフト、autopush 無効（.pio が手動 push するため）、threshold=32 */
     sm_config_set_in_shift(&c, true, false, 32);

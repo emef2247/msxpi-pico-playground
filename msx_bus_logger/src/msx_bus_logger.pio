@@ -18,8 +18,8 @@
 .program msx_bus_logger
 
 loop:
-    wait 0 gpio 26          ; /IORQ がLow（GPIO26）になるまで待つ
+    wait 0 gpio 25          ; /WR がLow（GPIO25）になるまで待つ
     in   pins, 32           ; GPIO0-31 を ISR に一括取り込む（アドレス+データ+制御線）
     push block              ; ISR（32bit）を RX FIFO へ手動プッシュ
-    wait 1 gpio 26          ; /IORQ がHighに戻るまで待つ
+    wait 1 gpio 25          ; /WR がHighに戻るまで待つ
     jmp  loop
