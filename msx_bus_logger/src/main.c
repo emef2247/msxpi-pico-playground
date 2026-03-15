@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
+#include "hardware/sync.h"
 #include "hardware/timer.h"
 #include "hardware/pio.h"
 #include "hardware/dma.h"
@@ -47,7 +48,7 @@
 /* 1: printfテキスト出力（デバッグ用）、0: バイナリ転送（本番用） */
 #define TEXT_MODE 0
 
-#define DMA_BLOCK_WORDS 512   /* 128 から増加: DMA IRQ 過多によるDROP防止 */
+#define DMA_BLOCK_WORDS 256
 #define LOG_ENTRIES (8 * 1024)
 #define LOG_BUF_MASK (LOG_ENTRIES - 1)
 
@@ -80,14 +81,100 @@ volatile bool logger_armed = false;
 
 /* TXリングバッファ: core0が書き込み、core1が読み出す */
 #if TEXT_MODE == 0
-#define TX_RING_PACKETS 1024                        /* 1024パケット × 12バイト = 12KB */
-#define TX_RING_SIZE    (TX_RING_PACKETS * 12)
+#define PKT_SIZE        11                          /* 全パケット固定長（STATUS/EVENT共通） */
+#define TX_RING_PACKETS 1024                        /* 1024パケット × 11バイト = 11KB */
+#define TX_RING_SIZE    (TX_RING_PACKETS * PKT_SIZE)
 
 static uint8_t   tx_ring[TX_RING_SIZE];             /* パケットバッファ本体 */
 static volatile uint32_t tx_wr = 0;                 /* core0が書き込むインデックス（パケット単位） */
 static volatile uint32_t tx_rd = 0;                 /* core1が読み出すインデックス（パケット単位） */
 static volatile uint32_t tx_drop_count = 0;         /* TXバッファ溢れカウント */
 #endif
+
+/* ===== TXリングバッファ書き込み関数（TEXT_MODE=0 時のみ）===== */
+/* これらは dma_handler()（ISR）とメインループ両方から呼ばれる。
+ * 同一コア（core0）上の割り込みによる preemption のため、
+ * enqueue_event_packet() は割り込みを無効化して競合を防ぐ。 */
+#if TEXT_MODE == 0
+
+/* EVENTパケット（TYPE=0x02）をTXリングバッファへエンキューする
+ *   Byte 0-1 : 0xAA 0x55 (マジック)
+ *   Byte 2   : 0x02 (TYPE=EVENT)
+ *   Byte 3   : FLAGS
+ *   Byte 4-5 : ADDR (little-endian)
+ *   Byte 6   : DATA
+ *   Byte 7-10: 予約 (0x00)
+ */
+static inline void enqueue_event_packet(uint16_t addr, uint8_t data, uint8_t flags) {
+    uint32_t save = save_and_disable_interrupts();
+
+    uint32_t wr = tx_wr;
+    uint32_t rd = tx_rd;
+
+    if (wr - rd >= TX_RING_PACKETS) {
+        tx_drop_count++;
+        restore_interrupts(save);
+        return;
+    }
+
+    uint32_t idx = wr & (TX_RING_PACKETS - 1u);
+    uint8_t *pkt = &tx_ring[idx * PKT_SIZE];
+
+    pkt[0]  = 0xAA;
+    pkt[1]  = 0x55;
+    pkt[2]  = 0x02;                    /* TYPE=EVENT */
+    pkt[3]  = flags;
+    pkt[4]  = (uint8_t)(addr & 0xFF);  /* ADDR 下位バイト */
+    pkt[5]  = (uint8_t)(addr >> 8);    /* ADDR 上位バイト */
+    pkt[6]  = data;
+    pkt[7]  = 0x00;                    /* 予約 */
+    pkt[8]  = 0x00;
+    pkt[9]  = 0x00;
+    pkt[10] = 0x00;
+
+    tx_wr = wr + 1u;
+    restore_interrupts(save);
+}
+
+/* STATUSパケット（TYPE=0x01）をTXリングバッファへエンキューする
+ *   Byte 0-1 : 0xAA 0x55 (マジック)
+ *   Byte 2   : 0x01 (TYPE=STATUS)
+ *   Byte 3   : DROP_LATCH
+ *   Byte 4   : DROP_SEQ
+ *   Byte 5-8 : TIMESTAMP (uint32_t, μs, little-endian)
+ *   Byte 9-10: PENDING   (uint16_t, little-endian)
+ *
+ * ISR（dma_handler）から呼ばれるため短時間で完了すること。
+ */
+static inline void enqueue_status_packet(uint8_t drop_latch, uint8_t drop_seq_val,
+                                          uint32_t timestamp, uint16_t pending) {
+    uint32_t wr = tx_wr;
+    uint32_t rd = tx_rd;
+
+    if (wr - rd >= TX_RING_PACKETS) {
+        tx_drop_count++;
+        return;
+    }
+
+    uint32_t idx = wr & (TX_RING_PACKETS - 1u);
+    uint8_t *pkt = &tx_ring[idx * PKT_SIZE];
+
+    pkt[0]  = 0xAA;
+    pkt[1]  = 0x55;
+    pkt[2]  = 0x01;                        /* TYPE=STATUS */
+    pkt[3]  = drop_latch;
+    pkt[4]  = drop_seq_val;
+    pkt[5]  = (uint8_t)(timestamp       ); /* TIMESTAMP byte0 */
+    pkt[6]  = (uint8_t)(timestamp >>  8 ); /* TIMESTAMP byte1 */
+    pkt[7]  = (uint8_t)(timestamp >> 16 ); /* TIMESTAMP byte2 */
+    pkt[8]  = (uint8_t)(timestamp >> 24 ); /* TIMESTAMP byte3 */
+    pkt[9]  = (uint8_t)(pending & 0xFF  ); /* PENDING 下位バイト */
+    pkt[10] = (uint8_t)(pending >> 8    ); /* PENDING 上位バイト */
+
+    tx_wr = wr + 1u;
+}
+
+#endif /* TEXT_MODE == 0 */
 
 /* LED 状態 */
 static LedMode  led_mode           = LED_OFF;
@@ -116,7 +203,7 @@ void pio_init_logger(void) {
 
     /* in_base = GPIO0 (A0): in pins, 32 でアドレス+データ+制御線を一括取り込む */
     sm_config_set_in_pins(&c, PIN_A0);
-    sm_config_set_jmp_pin(&c, PIN_IORQ);
+    sm_config_set_jmp_pin(&c, PIN_WR); // /IORQから/WRトリガに変更。MemoryMappedIOもログ対象にするため
 
     /* 左シフト、autopush 無効（.pio が手動 push するため）、threshold=32 */
     sm_config_set_in_shift(&c, true, false, 32);
@@ -157,6 +244,13 @@ void __isr dma_handler(void) {
         drop_latched = true;
         drop_seq++;
     }
+
+#if TEXT_MODE == 0
+    /* STATUSパケットをエンキュー */
+    uint32_t ts = time_us_32();
+    uint16_t pend16 = (pending > 0xFFFFu) ? 0xFFFFu : (uint16_t)pending;
+    enqueue_status_packet(drop_latched ? 1u : 0u, drop_seq, ts, pend16);
+#endif
 }
 
 void dma_init_logger_with_ring_enabled(PIO pio, uint sm) {
@@ -193,16 +287,18 @@ static inline uint8_t extract_data(uint32_t raw) {
 }
 
 /* FLAGS バイトを生成する
- * ISR[24] = /RD  (GPIO24) : Low=アサート
- * ISR[25] = /WR  (GPIO25) : Low=アサート
- * ISR[26] = /IORQ(GPIO26) : Low=アサート */
+ * ISR[24] = /RD    (GPIO24) : Low=アサート
+ * ISR[25] = /WR    (GPIO25) : Low=アサート
+ * ISR[26] = /IORQ  (GPIO26) : Low=アサート
+ * ISR[27] = /SLTSL (GPIO27) : Low=アサート
+ * ISR[28] = /WAIT  (GPIO28) : Low=アサート */
 static inline uint8_t make_flags(uint32_t raw) {
     uint8_t f = 0;
-    if (!(raw & (1u << 24))) f |= 1 << 0; /* /RD がアサート → RD フラグ */
-    if (!(raw & (1u << 25))) f |= 1 << 1; /* /WR がアサート → WR フラグ */
-    if (!(raw & (1u << 26))) f |= 1 << 2; /* /IORQ がアサート → IO フラグ */
-    if (drop_latched)        f |= 1 << 4; /* DROP ラッチフラグ */
-    if (dma_lag)             f |= 1 << 6; /* DMA 遅延フラグ */
+    if (!(raw & (1u << 24))) f |= 1 << 0; /* /RD    がアサート */
+    if (!(raw & (1u << 25))) f |= 1 << 1; /* /WR    がアサート */
+    if (!(raw & (1u << 26))) f |= 1 << 2; /* /IORQ  がアサート */
+    if (!(raw & (1u << 27))) f |= 1 << 3; /* /SLTSL がアサート */
+    if (!(raw & (1u << 28))) f |= 1 << 4; /* /WAIT  がアサート */
     return f;
 }
 
@@ -225,50 +321,8 @@ static void update_led(uint32_t now_ms_val) {
     }
 }
 
-/* ===== TXリングバッファへの書き込みとcore1 USB送信（TEXT_MODE=0 時のみ）===== */
+/* ===== core1 USB送信（TEXT_MODE=0 時のみ）===== */
 #if TEXT_MODE == 0
-
-/* core0: パケット組み立てとTXリングバッファへの書き込み
- *
- * パケットフォーマット:
- *   Byte 0   : マジックバイト1 (0xAA)
- *   Byte 1   : マジックバイト2 (0x55)
- *   Byte 2   : FLAGS
- *   Byte 3   : DROP_SEQ
- *   Byte 4-5 : ADDR (little-endian, A0-A15)
- *   Byte 6   : DATA (D0-D7)
- *   Byte 7   : 予約 (0x00)
- *   Byte 8-11: タイムスタンプ (uint32_t, little-endian, μs, time_us_32() の値)
- */
-static inline void enqueue_packet(uint16_t addr, uint8_t data, uint8_t flags, uint8_t drop_seq_val) {
-    uint32_t wr = __atomic_load_n(&tx_wr, __ATOMIC_ACQUIRE);
-    uint32_t rd = __atomic_load_n(&tx_rd, __ATOMIC_ACQUIRE);
-
-    if (wr - rd >= TX_RING_PACKETS) {
-        /* TXバッファ溢れ: DROP としてカウントしてスキップ */
-        __atomic_fetch_add(&tx_drop_count, 1u, __ATOMIC_RELAXED);
-        return;
-    }
-
-    uint32_t ts = time_us_32();
-    uint32_t idx = wr & (TX_RING_PACKETS - 1u);  /* TX_RING_PACKETS は2のべき乗 */
-    uint8_t *pkt = &tx_ring[idx * 12];
-
-    pkt[0]  = 0xAA;                    /* マジックバイト1 */
-    pkt[1]  = 0x55;                    /* マジックバイト2 */
-    pkt[2]  = flags;                   /* FLAGS */
-    pkt[3]  = drop_seq_val;            /* DROP_SEQ */
-    pkt[4]  = (uint8_t)(addr & 0xFF);  /* ADDR 下位バイト */
-    pkt[5]  = (uint8_t)(addr >> 8);    /* ADDR 上位バイト */
-    pkt[6]  = data;                    /* DATA */
-    pkt[7]  = 0x00;                    /* 予約 */
-    pkt[8]  = (uint8_t)(ts        );   /* タイムスタンプ byte0 */
-    pkt[9]  = (uint8_t)(ts >>  8  );   /* タイムスタンプ byte1 */
-    pkt[10] = (uint8_t)(ts >> 16  );   /* タイムスタンプ byte2 */
-    pkt[11] = (uint8_t)(ts >> 24  );   /* タイムスタンプ byte3 */
-
-    __atomic_store_n(&tx_wr, wr + 1u, __ATOMIC_RELEASE);
-}
 
 /* core1メイン: TXリングバッファからパケットをUSB送信する */
 void core1_usb_sender(void) {
@@ -285,11 +339,11 @@ void core1_usb_sender(void) {
 
         /* TXリングバッファからパケットを取り出す */
         uint32_t idx = rd & (TX_RING_PACKETS - 1u);  /* TX_RING_PACKETS は2のべき乗 */
-        uint8_t *pkt = &tx_ring[idx * 12];
+        uint8_t *pkt = &tx_ring[idx * PKT_SIZE];
 
         if (stdio_usb_connected()) {
-            /* USB接続中: 12バイト一括送信 */
-            fwrite(pkt, 1, 12, stdout);
+            /* USB接続中: PKT_SIZE バイト一括送信 */
+            fwrite(pkt, 1, PKT_SIZE, stdout);
             fflush(stdout);
         }
         /* 未接続時もインデックスを進めてバッファを解放する（読み捨て） */
@@ -392,22 +446,9 @@ int main(void) {
             uint8_t  data  = extract_data(raw);
             uint8_t  flags = make_flags(raw);
 
-#if TEXT_MODE == 1
-            /* テキストモード: printf でイベントを出力
-             * アクセス種別ラベル: IO（/IORQ）を最優先、次に RD、WR の順 */
-            const char *label = (flags & (1 << 2)) ? "IO"
-                               : (flags & (1 << 0)) ? "RD"
-                               : (flags & (1 << 1)) ? "WR"
-                               : "--";
-            if (drop_latched) {
-                printf("%s A=%04X D=%02X F=%02X [DROP seq=%u]\n",
-                       label, addr, data, flags, (unsigned)drop_seq);
-            } else {
-                printf("%s A=%04X D=%02X F=%02X\n", label, addr, data, flags);
-            }
-#else
-            /* バイナリモード: TXリングバッファにパケットをエンキュー */
-            enqueue_packet(addr, data, flags, drop_seq);
+#if TEXT_MODE == 0
+            /* バイナリモード: TXリングバッファにEVENTパケットをエンキュー */
+            enqueue_event_packet(addr, data, flags);
 #endif
         }
 
