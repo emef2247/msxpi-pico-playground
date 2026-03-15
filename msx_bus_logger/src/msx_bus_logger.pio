@@ -11,7 +11,9 @@
 ;   [24]    = /RD     (GPIO24)    : Low=アサート
 ;   [25]    = /WR     (GPIO25)    : Low=アサート
 ;   [26]    = /IORQ   (GPIO26)    : Low=アサート（サンプル時は常にLow）
-;   [31:27] = 未使用  (GPIO27-31)
+;   [27]    = /SLTSL  (GPIO27)    : Low=アサート
+;   [28]    = /WAIT   (GPIO28)    : Low=アサート
+;   [31:29] = 未使用  (GPIO29-31)
 
 .program msx_bus_logger
 
