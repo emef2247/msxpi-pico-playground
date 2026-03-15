@@ -44,9 +44,9 @@ FLAGSビット定義（EVENTパケット Byte 3）:
     bit 5-7: 未使用 (0)
 
 IOアドレス定義（テーブル駆動方式）:
-    IO_PORT_TABLE  : IOポートアドレス範囲 → デバイス名のマッピング
+    IO_PORT_TABLE  : IOポートアドレス範囲 → (デバイス名, RDラベル, WRラベル, アドレス表記)
     MEM_PORT_TABLE : メモリアドレス範囲 → デバイス名のマッピング
-    方向（RD/WR）はFLAGSビットで判定するため、テーブルには含まない。
+    サマリは RD/WR を区別して表示する。ゼロ件の行は表示しない。
 """
 
 import argparse
@@ -85,33 +85,45 @@ FLAG_WAIT  = 1 << 4  # /WAIT アサート
 
 # ─────────────────────────────────────────
 # IOポートテーブル（テーブル駆動方式）
-# (addr_lo, addr_hi, device_name, description)
-# 下位8ビットで照合する。優先順位: 先に定義されたエントリが優先。
+#
+# (addr_lo, addr_hi, device_key, rd_label, wr_label, addr_str)
+#   device_key : カウンタの辞書キー（RD/WR 共通）
+#   rd_label   : サマリ表示ラベル（RD側）
+#   wr_label   : サマリ表示ラベル（WR側）
+#   addr_str   : サマリのアドレス表記
 # ─────────────────────────────────────────
 IO_PORT_TABLE = [
-    (0x7C, 0x7D, 'OPLL',      'OPLL WR (YM2413/MSX-Music)'),
-    (0x7E, 0x7E, 'OPLL',      'OPLL RD status (YM2413)'),
-    (0x98, 0x9B, 'VDP',       'VDP (TMS9918/V9938/V9958)'),
-    (0xA0, 0xA2, 'PSG',       'PSG (AY-3-8910)'),
-    (0xC0, 0xC3, 'MSX-Audio', 'MSX-Audio (Y8950)'),
+    (0x7C, 0x7D, 'OPLL',      'OPLL RD (0x7C-0x7D)',      'OPLL WR (0x7C-0x7D)',      '0x7C-0x7D'),
+    (0x7E, 0x7E, 'OPLL',      'OPLL RD (0x7E)',            'OPLL WR (0x7E)',            '0x7E'),
+    (0x98, 0x9B, 'VDP',       'VDP RD (0x98-0x9B)',        'VDP WR (0x98-0x9B)',        '0x98-0x9B'),
+    (0xA0, 0xA2, 'PSG',       'PSG RD (0xA0-0xA2)',        'PSG WR (0xA0-0xA2)',        '0xA0-0xA2'),
+    (0xC0, 0xC3, 'MSX-Audio', 'MSX-Audio RD (0xC0-0xC3)', 'MSX-Audio WR (0xC0-0xC3)', '0xC0-0xC3'),
 ]
 
+# サマリ表示順（IO_PORT_TABLE の device_key の登場順、重複除去）
+_IO_SUMMARY_ORDER = []
+_seen = set()
+for _lo, _hi, _key, _rdlbl, _wrlbl, _astr in IO_PORT_TABLE:
+    if _key not in _seen:
+        _IO_SUMMARY_ORDER.append((_key, _rdlbl, _wrlbl))
+        _seen.add(_key)
+
 # MEMアドレステーブル（16ビット全体で照合）
-# (addr_lo, addr_hi, device_name, description)
+# (addr_lo, addr_hi, device_key, label, addr_str)
 MEM_PORT_TABLE = [
-    (0x9000, 0x9000, 'SCC Bank',  'SCC バンク切り替え'),
-    (0x9800, 0x9FFF, 'SCC WR',    'SCC 波形データ WR'),
-    (0xB800, 0xBFFF, 'SCC-I WR',  'SCC-I 波形データ WR'),
+    (0x9800, 0x9FFF, 'SCC WR',   'SCC WR (0x9800-0x9FFF)',   '0x9800-0x9FFF'),
+    (0xB800, 0xBFFF, 'SCC-I WR', 'SCC-I WR (0xB800-0xBFFF)', '0xB800-0xBFFF'),
+    (0x9000, 0x9000, 'SCC Bank', 'SCC Bank SW (0x9000)',      '0x9000'),
 ]
 
 
 def _build_io_map():
-    """IO_PORT_TABLE からアドレス→デバイス名の辞書を生成する（先勝ち）"""
+    """IO_PORT_TABLE からアドレス→device_key の辞書を生成する（先勝ち）"""
     addr_map = {}
-    for lo, hi, name, _ in IO_PORT_TABLE:
+    for lo, hi, key, *_ in IO_PORT_TABLE:
         for addr in range(lo, hi + 1):
             if addr not in addr_map:
-                addr_map[addr] = name
+                addr_map[addr] = key
     return addr_map
 
 
@@ -119,15 +131,15 @@ IO_MAP = _build_io_map()
 
 
 def lookup_io_device(addr_lo):
-    """IOアドレス（下位8ビット）からデバイス名を返す"""
+    """IOアドレス（下位8ビット）から device_key を返す"""
     return IO_MAP.get(addr_lo, 'Other IO')
 
 
 def lookup_mem_device(addr):
-    """メモリアドレス（16ビット）からデバイス名を返す。一致しなければ None"""
-    for lo, hi, name, _ in MEM_PORT_TABLE:
+    """メモリアドレス（16ビット）から device_key を返す。一致しなければ None"""
+    for lo, hi, key, *_ in MEM_PORT_TABLE:
         if lo <= addr <= hi:
-            return name
+            return key
     return None
 
 
@@ -181,14 +193,12 @@ def sync_to_magic(ser, raw_file=None):
             if raw_file:
                 raw_file.write(b2)
             if b2[0] == 0x55:
-                # マジック検出: TYPEバイトを読む
                 type_b = ser.read(1)
                 if not type_b:
                     return None, None
                 if raw_file:
                     raw_file.write(type_b)
                 pkt_type = type_b[0]
-                # 残りのバイトを読む (PACKET_SIZE - 3 バイト)
                 try:
                     rest = read_exact(ser, PACKET_SIZE - 3)
                 except IOError:
@@ -220,24 +230,26 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
 
     # ── 集計カウンタ ──────────────────────────
     count_event        = 0   # EVENTパケット総数
-    count_io           = 0   # IOアクセス（IORQ=Low かつ WR=Low）
+    count_io           = 0   # IOアクセス（IORQ=Low）
     count_mem_wr       = 0   # MEM Write（テーブル一致分）
     count_mem_wr_other = 0   # MEM Write（テーブル不一致分）
     count_status_pkts  = 0
 
-    io_device_counts  = defaultdict(int)  # key: device_name
-    mem_device_counts = defaultdict(int)  # key: device_name
+    # IO カウンタ: key=(device_key, 'RD') or (device_key, 'WR')
+    io_device_counts  = defaultdict(int)
+    # MEM カウンタ: key=device_key
+    mem_device_counts = defaultdict(int)
 
     # STATUSパケットから取得する状態
-    drop_latch_ever    = False  # 一度でも drop_latch=1 を受信したか
-    drop_seq_latest    = 0
+    drop_latch_ever = False
+    drop_seq_latest = 0
 
     # ── peak 計測（PC時刻ベース 1秒ウィンドウ）──
     window_start       = time.time()
     window_event_count = 0
     window_bytes       = 0
-    peak_rate          = 0.0   # events/sec
-    peak_throughput    = 0.0   # KB/sec
+    peak_rate          = 0.0
+    peak_throughput    = 0.0
 
     start_time = time.time()
 
@@ -249,6 +261,7 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
 
             raw_packet = MAGIC + bytes([pkt_type]) + rest
 
+            # ── STATUSパケット ────────────────────
             if pkt_type == PKT_TYPE_STATUS:
                 try:
                     _, _, drop_latch, drop_seq_val, timestamp, pending = \
@@ -256,13 +269,11 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
                 except struct.error:
                     continue
 
-                # STATUSパケット受信時の状態更新
                 if drop_latch:
                     drop_latch_ever = True
-                drop_seq_latest  = drop_seq_val
+                drop_seq_latest   = drop_seq_val
                 count_status_pkts += 1
 
-                # ── DROP 警告 ─────────────────────────
                 if warn_drop and drop_latch:
                     print(
                         f'[!DROP] status drop_seq={drop_seq_val} pending={pending}'
@@ -270,7 +281,6 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
                         file=sys.stderr
                     )
 
-                # ── peak 更新（STATUSパケットもバイト計上）──
                 now = time.time()
                 window_bytes += PACKET_SIZE
                 elapsed_win = now - window_start
@@ -283,7 +293,6 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
                     window_event_count = 0
                     window_bytes       = 0
 
-                # ── CSV書き込み（STATUSパケット）──────────
                 csv_writer.writerow([
                     '', 'STATUS', timestamp,
                     '', '', '', '', '',
@@ -291,9 +300,9 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
                     drop_latch, drop_seq_val, pending,
                     '',
                 ])
-
                 continue
 
+            # ── EVENTパケット ─────────────────────
             elif pkt_type == PKT_TYPE_EVENT:
                 try:
                     _, _, flags, addr, data, _reserved = \
@@ -301,27 +310,34 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
                 except struct.error:
                     continue
 
-                # ── FLAGSビット展開 ──────────────────
+                rd    = bool(flags & FLAG_RD)
                 wr    = bool(flags & FLAG_WR)
                 io    = bool(flags & FLAG_IO)
                 sltsl = bool(flags & FLAG_SLTSL)
 
-                # ── アクセス種別・デバイス別カウント ──────
-                if io and wr:
-                    # IO アクセス（IORQ=Low かつ WR=Low）
+                device_key   = ''
+                device_label = ''
+
+                if io:
+                    # IO アクセス（/IORQ=Low）: RD/WR 両方カウント
                     count_io += 1
-                    device = lookup_io_device(addr & 0xFF)
-                    io_device_counts[device] += 1
+                    device_key = lookup_io_device(addr & 0xFF)
+                    direction  = 'RD' if rd else 'WR'
+                    io_device_counts[(device_key, direction)] += 1
+                    device_label = f'{device_key} {direction}'
+
                 elif wr and not io:
-                    # MEM Write（IORQ=High かつ WR=Low）
-                    device = lookup_mem_device(addr)
-                    if device is not None:
+                    # MEM Write（/IORQ=High かつ /WR=Low）
+                    device_key = lookup_mem_device(addr)
+                    if device_key is not None:
                         count_mem_wr += 1
-                        mem_device_counts[device] += 1
+                        mem_device_counts[device_key] += 1
+                        device_label = device_key
                     else:
                         count_mem_wr_other += 1
+                        device_label = ''
 
-                # ── peak 更新（1秒ウィンドウ）──────────
+                # ── peak 更新 ──────────────────────
                 now = time.time()
                 window_event_count += 1
                 window_bytes       += PACKET_SIZE
@@ -335,15 +351,6 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
                     window_event_count = 0
                     window_bytes       = 0
 
-                # ── デバイスラベル（CSV用）──────────────
-                if io and wr:
-                    device_label = lookup_io_device(addr & 0xFF)
-                elif wr and not io:
-                    device_label = lookup_mem_device(addr) or ''
-                else:
-                    device_label = ''
-
-                # ── CSV書き込み（EVENTパケット）──────────
                 csv_writer.writerow([
                     count_event, 'EVENT', '',
                     f'0x{addr:04X}', addr,
@@ -357,7 +364,6 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
                 count_event += 1
 
             else:
-                # 未知のパケットタイプ: スキップ
                 continue
 
     except KeyboardInterrupt:
@@ -366,7 +372,6 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
         avg_tp   = ((count_event + count_status_pkts) * PACKET_SIZE / 1024.0) / elapsed \
                    if elapsed > 0 else 0.0
 
-        # ── サマリ表示 ────────────────────────────
         W_LABEL = 29
 
         def row(label, value, indent=0):
@@ -376,26 +381,26 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
 
         print()
         print('=== Capture Summary ===')
-        print(row('Total Events',   fmt_num(count_event)))
-        print(row('IO Access',      fmt_num(count_io),    indent=1))
+        print(row('Total Events', fmt_num(count_event)))
+        print(row('IO Access',    fmt_num(count_io), indent=1))
 
-        # io_device_counts のうち count > 0 のものを IO_PORT_TABLE の順番で表示
-        printed_io = set()
-        for lo, hi, name, _ in IO_PORT_TABLE:
-            if name in printed_io:
-                continue
-            printed_io.add(name)
-            cnt = io_device_counts.get(name, 0)
-            if cnt > 0:
-                print(row(name, fmt_num(cnt), indent=2))
+        # IO デバイス別 RD/WR を IO_PORT_TABLE 定義順で表示（ゼロ行非表示）
+        for dev_key, rd_lbl, wr_lbl in _IO_SUMMARY_ORDER:
+            cnt_rd = io_device_counts.get((dev_key, 'RD'), 0)
+            cnt_wr = io_device_counts.get((dev_key, 'WR'), 0)
+            if cnt_rd > 0:
+                print(row(rd_lbl, fmt_num(cnt_rd), indent=2))
+            if cnt_wr > 0:
+                print(row(wr_lbl, fmt_num(cnt_wr), indent=2))
 
         # MEM Write（0件なら行ごと非表示）
-        if count_mem_wr > 0 or count_mem_wr_other > 0:
-            print(row('MEM Write', fmt_num(count_mem_wr + count_mem_wr_other), indent=1))
-            for _, _, name, _ in MEM_PORT_TABLE:
-                cnt = mem_device_counts.get(name, 0)
+        total_mem = count_mem_wr + count_mem_wr_other
+        if total_mem > 0:
+            print(row('MEM Write', fmt_num(total_mem), indent=1))
+            for _, _, key, label, _ in MEM_PORT_TABLE:
+                cnt = mem_device_counts.get(key, 0)
                 if cnt > 0:
-                    print(row(name, fmt_num(cnt), indent=2))
+                    print(row(label, fmt_num(cnt), indent=2))
 
         print(row('DROP Latch',     fmt_num(1 if drop_latch_ever else 0)))
         print(row('DROP Sequence',  fmt_num(drop_seq_latest)))
