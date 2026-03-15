@@ -62,6 +62,7 @@ import csv
 import struct
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime
 
 import serial
@@ -84,13 +85,90 @@ FLAG_DROP_LATCHED = 1 << 4  # DROP ラッチフラグ
 FLAG_DMA_LAG      = 1 << 6  # DMA 遅延フラグ
 
 # ─────────────────────────────────────────
-# IOアドレスセット定義（下位8ビットで照合）
+# IO ポートテーブル（https://www.msx.org/wiki/I/O_Ports_List ベース）
+# (addr_lo, addr_hi, direction, device_name, description)
+# direction: 'R'=Read のみ, 'W'=Write のみ, 'RW'=両方
 # ─────────────────────────────────────────
-VDP_ADDRS       = frozenset([0x98, 0x99, 0x9A, 0x9B])  # VDP (TMS9918/V9938/V9958)
-PSG_ADDRS       = frozenset([0xA0, 0xA1, 0xA2])         # PSG (AY-3-8910)
-OPLL_WR_ADDRS   = frozenset([0x7C, 0x7D])               # OPLL WR (YM2413)
-OPLL_RD_ADDRS   = frozenset([0x7E])                     # OPLL RD (ステータス)
-MSXAUDIO_ADDRS  = frozenset([0xC0, 0xC1, 0xC2, 0xC3])  # MSX-Audio (Y8950)
+IO_PORT_TABLE = [
+    (0x00, 0x07, 'RW', 'Internal',   'MSX system internal'),
+    (0x08, 0x08, 'W',  'VDP',        'Wait disable (MSX2+/turboR)'),
+    (0x0F, 0x0F, 'RW', 'System',     'Software reset / system flags'),
+    (0x10, 0x17, 'RW', 'MSX-Audio',  'MSX-Audio PCM port (Y8950)'),
+    (0x1A, 0x1B, 'RW', 'FM-PAC',     'FM-PAC (MSX-Music clone, Panasonic)'),
+    (0x20, 0x27, 'RW', 'RS-232',     'RS-232C (MSX2+)'),
+    (0x2E, 0x2F, 'RW', 'System',     'MSX2+ system'),
+    (0x3F, 0x3F, 'W',  'TurboR',     'CPU mode switch (turboR)'),
+    (0x40, 0x4F, 'RW', 'Disk',       'Floppy disk controller (WD2793/TC8566)'),
+    (0x50, 0x57, 'RW', 'SCSI',       'SCSI interface (MSX-SCSI)'),
+    (0x60, 0x67, 'RW', 'Kanji',      'Kanji ROM controller'),
+    (0x70, 0x77, 'RW', 'MIDI',       'MIDI interface'),
+    (0x7C, 0x7C, 'W',  'OPLL',       'OPLL register select (YM2413/MSX-Music)'),
+    (0x7D, 0x7D, 'W',  'OPLL',       'OPLL data write (YM2413/MSX-Music)'),
+    (0x7E, 0x7E, 'R',  'OPLL',       'OPLL status read (YM2413)'),
+    (0x80, 0x87, 'RW', 'RS-232',     'RS-232C (8251/8253)'),
+    (0x90, 0x90, 'RW', 'Printer',    'Printer strobe / status'),
+    (0x91, 0x91, 'W',  'Printer',    'Printer data'),
+    (0x98, 0x98, 'RW', 'VDP',        'VDP data port (TMS9918/V9938/V9958)'),
+    (0x99, 0x99, 'RW', 'VDP',        'VDP register / status port'),
+    (0x9A, 0x9A, 'W',  'VDP',        'VDP palette port (V9938/V9958)'),
+    (0x9B, 0x9B, 'W',  'VDP',        'VDP indirect register port (V9938/V9958)'),
+    (0xA0, 0xA0, 'W',  'PSG',        'PSG register select (AY-3-8910)'),
+    (0xA1, 0xA1, 'W',  'PSG',        'PSG data write (AY-3-8910)'),
+    (0xA2, 0xA2, 'R',  'PSG',        'PSG data read (AY-3-8910)'),
+    (0xA8, 0xA8, 'RW', 'PPI',        'PPI port A / slot select (8255)'),
+    (0xA9, 0xA9, 'R',  'PPI',        'PPI port B / keyboard row (8255)'),
+    (0xAA, 0xAA, 'RW', 'PPI',        'PPI port C / key/CAS/beep (8255)'),
+    (0xAB, 0xAB, 'W',  'PPI',        'PPI control register (8255)'),
+    (0xB0, 0xB3, 'RW', 'Calendar',   'Clock/Calendar (RP5C01)'),
+    (0xB8, 0xBB, 'RW', 'LightPen',   'Light pen'),
+    # C0h-C3h: MSX-Audio 優先（Moonsound alternative ports より先に定義）
+    (0xC0, 0xC0, 'W',  'MSX-Audio', 'MSX-Audio register select ch1 (Y8950)'),
+    (0xC1, 0xC1, 'RW', 'MSX-Audio', 'MSX-Audio data/status ch1 (Y8950)'),
+    (0xC2, 0xC2, 'W',  'MSX-Audio', 'MSX-Audio register select ch2 (Y8950)'),
+    (0xC3, 0xC3, 'W',  'MSX-Audio', 'MSX-Audio data ch2 (Y8950)'),
+    (0xC4, 0xC7, 'RW', 'Moonsound', 'Moonsound / OPL4 (YMF278B) primary ports'),
+    (0xD0, 0xD7, 'RW', 'Disk-Ext',   'FDC extended (Microsol)'),
+    (0xD8, 0xD9, 'RW', 'Kanji',     'Kanji ROM JIS1 address'),
+    (0xDA, 0xDB, 'RW', 'Kanji',     'Kanji ROM JIS2 address'),
+    (0xE0, 0xE3, 'RW', 'MemMapper', 'Memory mapper control'),
+    (0xE4, 0xE7, 'R',  'MemMapper', 'Memory mapper slot register read'),
+    (0xE8, 0xEB, 'RW', 'System',    'MSX2+ / turboR system'),
+    (0xF0, 0xF3, 'RW', 'TurboR',    'turboR / MSX-Engine control'),
+    (0xF4, 0xF4, 'RW', 'System',    'System flags (MSX2+/turboR)'),
+    (0xF5, 0xF5, 'RW', 'System',    'System flags B'),
+    (0xF6, 0xF7, 'RW', 'System',    'Color bus / system'),
+    (0xF8, 0xFB, 'RW', 'TurboR',    'turboR internal'),
+    (0xFC, 0xFF, 'RW', 'MemMapper', 'Memory mapper page select (page 0-3)'),
+]
+
+
+def build_port_map():
+    """IO_PORT_TABLE から高速ルックアップ辞書を生成する（先着優先）"""
+    port_map = {}
+    for lo, hi, direction, device_name, _ in IO_PORT_TABLE:
+        for addr in range(lo, hi + 1):
+            if addr not in port_map:
+                port_map[addr] = (device_name, direction)
+    return port_map
+
+
+PORT_MAP = build_port_map()
+
+
+def lookup_io_device(addr_lo, is_rd):
+    """アドレスとアクセス方向からデバイス名を返す"""
+    entry = PORT_MAP.get(addr_lo)
+    if entry is None:
+        return 'Unknown'
+    device_name, direction = entry
+    if direction == 'RW':
+        return device_name
+    if direction == 'R' and is_rd:
+        return device_name
+    if direction == 'W' and not is_rd:
+        return device_name
+    return f'{device_name}(?dir)'
+
 
 BYTES_PER_EVENT = 12
 
@@ -167,14 +245,7 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
     # ── 集計カウンタ ──────────────────────────
     seq                = 0
     count_io           = 0
-    count_vdp_rd       = 0
-    count_vdp_wr       = 0
-    count_psg_rd       = 0
-    count_psg_wr       = 0
-    count_opll_rd      = 0
-    count_opll_wr      = 0
-    count_msxaudio_rd  = 0
-    count_msxaudio_wr  = 0
+    io_device_counts   = defaultdict(int)   # key: (device_name, 'RD' or 'WR')
     count_drop_flag    = 0
     last_drop_seq      = 0
 
@@ -215,25 +286,8 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
 
             if io:
                 count_io += 1
-                if addr_lo in VDP_ADDRS:
-                    if rd:
-                        count_vdp_rd += 1
-                    else:
-                        count_vdp_wr += 1
-                elif addr_lo in PSG_ADDRS:
-                    if rd:
-                        count_psg_rd += 1
-                    else:
-                        count_psg_wr += 1
-                elif addr_lo in OPLL_WR_ADDRS:
-                    count_opll_wr += 1
-                elif addr_lo in OPLL_RD_ADDRS:
-                    count_opll_rd += 1
-                elif addr_lo in MSXAUDIO_ADDRS:
-                    if rd:
-                        count_msxaudio_rd += 1
-                    else:
-                        count_msxaudio_wr += 1
+                device = lookup_io_device(addr_lo, rd)
+                io_device_counts[(device, 'RD' if rd else 'WR')] += 1
 
             if drop_latched:
                 count_drop_flag += 1
@@ -261,6 +315,7 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
                 )
 
             # ── CSV書き込み ──────────────────────
+            device_label = lookup_io_device(addr_lo, rd) if io else ''
             csv_writer.writerow([
                 seq,
                 timestamp,
@@ -275,6 +330,7 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
                 int(drop_latched),
                 int(dma_lag),
                 drop_seq,
+                device_label,
             ])
 
             seq += 1
@@ -295,16 +351,36 @@ def receive_loop(ser, csv_writer, raw_file, warn_drop, csv_filename, raw_filenam
         print()
         print('=== Capture Summary ===')
         print(row('Total Events',             fmt_num(seq)))
-        print(row('IO Access',                fmt_num(count_io),          indent=1))
-        print(row('VDP RD (0x98-0x9B)',       fmt_num(count_vdp_rd),      indent=2))
-        print(row('VDP WR (0x98-0x9B)',       fmt_num(count_vdp_wr),      indent=2))
-        print(row('PSG RD (0xA2)',            fmt_num(count_psg_rd),      indent=2))
-        print(row('PSG WR (0xA0-0xA1)',       fmt_num(count_psg_wr),      indent=2))
-        print(row('OPLL RD (0x7E)',           fmt_num(count_opll_rd),     indent=2))
-        print(row('OPLL WR (0x7C-0x7D)',      fmt_num(count_opll_wr),     indent=2))
-        print(row('MSX-Audio RD (0xC1)',      fmt_num(count_msxaudio_rd), indent=2))
-        print(row('MSX-Audio WR (0xC0-0xC3)', fmt_num(count_msxaudio_wr), indent=2))
-        print(row('SCC/SCC-I',               '(MEM_WR)',                  indent=2))
+        print(row('IO Access',                fmt_num(count_io),  indent=1))
+
+        # デバイス代表アドレス昇順でデバイス別カウントを表示
+        printed_devices = set()
+        for addr in range(0x100):
+            entry = PORT_MAP.get(addr)
+            if not entry:
+                continue
+            dev = entry[0]
+            if dev in printed_devices:
+                continue
+            printed_devices.add(dev)
+            rd_cnt = io_device_counts.get((dev, 'RD'), 0)
+            wr_cnt = io_device_counts.get((dev, 'WR'), 0)
+            if rd_cnt == 0 and wr_cnt == 0:
+                continue
+            if rd_cnt > 0:
+                print(row(f'{dev} RD', fmt_num(rd_cnt), indent=2))
+            if wr_cnt > 0:
+                print(row(f'{dev} WR', fmt_num(wr_cnt), indent=2))
+
+        # Unknown（テーブル未定義ポート）があれば末尾に表示
+        unknown_rd = io_device_counts.get(('Unknown', 'RD'), 0)
+        unknown_wr = io_device_counts.get(('Unknown', 'WR'), 0)
+        if unknown_rd > 0:
+            print(row('Unknown RD', fmt_num(unknown_rd), indent=2))
+        if unknown_wr > 0:
+            print(row('Unknown WR', fmt_num(unknown_wr), indent=2))
+
+        print(row('SCC/SCC-I',               '(MEM_WR)',          indent=2))
         print(row('DROP Latch',              fmt_num(count_drop_flag)))
         print(row('DROP Sequence',           fmt_num(last_drop_seq)))
         print(row('Elapsed Time',            f'{elapsed:>10.1f} sec'))
@@ -346,6 +422,7 @@ def main():
                     'seq', 'timestamp_us', 'addr_hex', 'addr_dec',
                     'data_hex', 'data_dec', 'flags_hex',
                     'rd', 'wr', 'io', 'drop_latched', 'dma_lag', 'drop_seq',
+                    'device',
                 ])
                 receive_loop(ser, csv_writer, raw_file_ctx, args.warn_drop,
                              csv_filename, raw_filename)
