@@ -58,6 +58,7 @@
 /* SM_ID */
 #define SM_ID_WR    0x00  /* SM0: /WR トリガー */
 #define SM_ID_IORQ  0x01  /* SM1: /IORQ トリガー */
+#define SM_ID_RD    0x02  /* SM2: /RD トリガー */
 
 /* パケットサイズ（STATUS/EVENT 共通、12バイト固定） */
 #define PKT_SIZE        12
@@ -75,30 +76,38 @@ typedef enum {
 PIO pio = pio0;
 uint sm0 = 0;   /* /WR トリガー */
 uint sm1 = 1;   /* /IORQ トリガー */
+uint sm2 = 2;   /* /RD トリガー */
 
 /* DMA チャンネル */
 int dma_chan0;   /* SM0用 */
 int dma_chan1;   /* SM1用 */
+int dma_chan2;   /* SM2用 */
 
 /* リングバッファ */
 uint32_t dma_raw_buf0[LOG_ENTRIES];  /* SM0用 */
 uint32_t dma_raw_buf1[LOG_ENTRIES];  /* SM1用 */
+uint32_t dma_raw_buf2[LOG_ENTRIES];  /* SM2用 */
 
 /* 書き込みインデックス（DMA ISR で更新） */
 volatile uint32_t dma_wr_idx0 = 0;
 volatile uint32_t dma_wr_idx1 = 0;
+volatile uint32_t dma_wr_idx2 = 0;
 
 /* 書き込み・読み出しカウンタ（SM別） */
 volatile uint32_t dma_write_count0 = 0;
 volatile uint32_t dma_write_count1 = 0;
+volatile uint32_t dma_write_count2 = 0;
 volatile uint32_t cpu_read_count0 = 0;
 volatile uint32_t cpu_read_count1 = 0;
+volatile uint32_t cpu_read_count2 = 0;
 
 /* DROP 状態（SM別） */
 static bool     drop_latched0 = false;
 static uint8_t  drop_seq0     = 0;
 static bool     drop_latched1 = false;
 static uint8_t  drop_seq1     = 0;
+static bool     drop_latched2 = false;
+static uint8_t  drop_seq2     = 0;
 
 volatile bool logger_armed = false;
 
@@ -328,6 +337,22 @@ void pio_init_logger(void) {
     pio_sm_init(pio, sm1, offset1, &c1);
     pio_sm_set_enabled(pio, sm1, true);
 
+    /* SM2: /RD トリガー */
+    uint offset2 = pio_add_program(pio, &msx_bus_logger_rd_program);
+    pio_sm_config c2 = msx_bus_logger_rd_program_get_default_config(offset2);
+    sm_config_set_in_pins(&c2, PIN_A0);
+    sm_config_set_jmp_pin(&c2, PIN_RD);
+    sm_config_set_in_shift(&c2, true, false, 32);
+    /* GPIO0-23 は SM0 で初期化済みのため再初期化不要
+     * PIN_RD (GPIO24) は pio_gpio_init() しない:
+     *   pio_gpio_init() を呼ぶと GPIO の機能が PIO に切り替わり、
+     *   enter_safe_state() で設定した OUT+High（MSXロゴ表示に必須）が失われる。
+     *   PIO の wait 命令は GPIO 機能に関わらず入力値を直接読み取るため、
+     *   pio_gpio_init() なしでも /RD を正しくトリガとして使用できる。 */
+    pio_sm_set_consecutive_pindirs(pio, sm2, PIN_A0, 24, false);
+    pio_sm_init(pio, sm2, offset2, &c2);
+    pio_sm_set_enabled(pio, sm2, true);
+
     /* オンボードLED初期化 */
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
@@ -336,54 +361,79 @@ void pio_init_logger(void) {
 
 /* ===== DMA 割り込みハンドラ ===== */
 
-/* SM0用 DMA割り込み (DMA_IRQ_0) */
-void __isr dma_handler0(void) {
-    dma_hw->ints0 = 1u << dma_chan0;
+/* 全SM用 DMA割り込み (DMA_IRQ_0) — チャンネル判定方式 */
+void __isr dma_handler_all(void) {
+    /* SM0 チャンネル発火チェック */
+    if (dma_hw->ints0 & (1u << dma_chan0)) {
+        dma_hw->ints0 = 1u << dma_chan0;
 
-    dma_wr_idx0 += DMA_BLOCK_WORDS;
-    dma_write_count0 = dma_wr_idx0;
+        dma_wr_idx0 += DMA_BLOCK_WORDS;
+        dma_write_count0 = dma_wr_idx0;
 
-    dma_channel_set_read_addr(dma_chan0, &pio->rxf[sm0], false);
-    dma_channel_set_write_addr(dma_chan0, &dma_raw_buf0[dma_wr_idx0 & LOG_BUF_MASK], true);
+        dma_channel_set_read_addr(dma_chan0, &pio->rxf[sm0], false);
+        dma_channel_set_write_addr(dma_chan0, &dma_raw_buf0[dma_wr_idx0 & LOG_BUF_MASK], true);
 
-    if (!logger_armed) return;
-
-    uint32_t pending = dma_write_count0 - cpu_read_count0;
-    if (pending > LOG_ENTRIES) {
-        drop_latched0 = true;
-        drop_seq0++;
+        if (logger_armed) {
+            uint32_t pending = dma_write_count0 - cpu_read_count0;
+            if (pending > LOG_ENTRIES) {
+                drop_latched0 = true;
+                drop_seq0++;
+            }
+#if TEXT_MODE == 0
+            uint32_t ts = time_us_32();
+            uint16_t pend16 = (pending > 0xFFFF) ? 0xFFFF : (uint16_t)pending;
+            enqueue_status_packet(SM_ID_WR, drop_latched0 ? 1 : 0, drop_seq0, ts, pend16);
+#endif
+        }
     }
 
+    /* SM1 チャンネル発火チェック */
+    if (dma_hw->ints0 & (1u << dma_chan1)) {
+        dma_hw->ints0 = 1u << dma_chan1;
+
+        dma_wr_idx1 += DMA_BLOCK_WORDS;
+        dma_write_count1 = dma_wr_idx1;
+
+        dma_channel_set_read_addr(dma_chan1, &pio->rxf[sm1], false);
+        dma_channel_set_write_addr(dma_chan1, &dma_raw_buf1[dma_wr_idx1 & LOG_BUF_MASK], true);
+
+        if (logger_armed) {
+            uint32_t pending = dma_write_count1 - cpu_read_count1;
+            if (pending > LOG_ENTRIES) {
+                drop_latched1 = true;
+                drop_seq1++;
+            }
 #if TEXT_MODE == 0
-    uint32_t ts = time_us_32();
-    uint16_t pend16 = (pending > 0xFFFF) ? 0xFFFF : (uint16_t)pending;
-    enqueue_status_packet(SM_ID_WR, drop_latched0 ? 1 : 0, drop_seq0, ts, pend16);
+            uint32_t ts = time_us_32();
+            uint16_t pend16 = (pending > 0xFFFF) ? 0xFFFF : (uint16_t)pending;
+            enqueue_status_packet(SM_ID_IORQ, drop_latched1 ? 1 : 0, drop_seq1, ts, pend16);
 #endif
-}
-
-/* SM1用 DMA割り込み (DMA_IRQ_1) */
-void __isr dma_handler1(void) {
-    dma_hw->ints1 = 1u << dma_chan1;
-
-    dma_wr_idx1 += DMA_BLOCK_WORDS;
-    dma_write_count1 = dma_wr_idx1;
-
-    dma_channel_set_read_addr(dma_chan1, &pio->rxf[sm1], false);
-    dma_channel_set_write_addr(dma_chan1, &dma_raw_buf1[dma_wr_idx1 & LOG_BUF_MASK], true);
-
-    if (!logger_armed) return;
-
-    uint32_t pending = dma_write_count1 - cpu_read_count1;
-    if (pending > LOG_ENTRIES) {
-        drop_latched1 = true;
-        drop_seq1++;
+        }
     }
 
+    /* SM2 チャンネル発火チェック */
+    if (dma_hw->ints0 & (1u << dma_chan2)) {
+        dma_hw->ints0 = 1u << dma_chan2;
+
+        dma_wr_idx2 += DMA_BLOCK_WORDS;
+        dma_write_count2 = dma_wr_idx2;
+
+        dma_channel_set_read_addr(dma_chan2, &pio->rxf[sm2], false);
+        dma_channel_set_write_addr(dma_chan2, &dma_raw_buf2[dma_wr_idx2 & LOG_BUF_MASK], true);
+
+        if (logger_armed) {
+            uint32_t pending = dma_write_count2 - cpu_read_count2;
+            if (pending > LOG_ENTRIES) {
+                drop_latched2 = true;
+                drop_seq2++;
+            }
 #if TEXT_MODE == 0
-    uint32_t ts = time_us_32();
-    uint16_t pend16 = (pending > 0xFFFF) ? 0xFFFF : (uint16_t)pending;
-    enqueue_status_packet(SM_ID_IORQ, drop_latched1 ? 1 : 0, drop_seq1, ts, pend16);
+            uint32_t ts = time_us_32();
+            uint16_t pend16 = (pending > 0xFFFF) ? 0xFFFF : (uint16_t)pending;
+            enqueue_status_packet(SM_ID_RD, drop_latched2 ? 1 : 0, drop_seq2, ts, pend16);
 #endif
+        }
+    }
 }
 
 /* ===== DMA 初期化 ===== */
@@ -400,11 +450,8 @@ void dma_init_logger(void) {
                           dma_raw_buf0, &pio->rxf[sm0],
                           DMA_BLOCK_WORDS, false);
     dma_channel_set_irq0_enabled(dma_chan0, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_handler0);
-    irq_set_enabled(DMA_IRQ_0, true);
-    dma_start_channel_mask(1u << dma_chan0);
 
-    /* SM1: DMA_IRQ_1 を使用 */
+    /* SM1: DMA_IRQ_0 を使用 */
     dma_chan1 = dma_claim_unused_channel(true);
     dma_channel_config cfg1 = dma_channel_get_default_config(dma_chan1);
     channel_config_set_transfer_data_size(&cfg1, DMA_SIZE_32);
@@ -415,10 +462,26 @@ void dma_init_logger(void) {
     dma_channel_configure(dma_chan1, &cfg1,
                           dma_raw_buf1, &pio->rxf[sm1],
                           DMA_BLOCK_WORDS, false);
-    dma_channel_set_irq1_enabled(dma_chan1, true);
-    irq_set_exclusive_handler(DMA_IRQ_1, dma_handler1);
-    irq_set_enabled(DMA_IRQ_1, true);
-    dma_start_channel_mask(1u << dma_chan1);
+    dma_channel_set_irq0_enabled(dma_chan1, true);
+
+    /* SM2: DMA_IRQ_0 を使用 */
+    dma_chan2 = dma_claim_unused_channel(true);
+    dma_channel_config cfg2 = dma_channel_get_default_config(dma_chan2);
+    channel_config_set_transfer_data_size(&cfg2, DMA_SIZE_32);
+    channel_config_set_dreq(&cfg2, pio_get_dreq(pio, sm2, false));
+    channel_config_set_read_increment(&cfg2, false);
+    channel_config_set_write_increment(&cfg2, true);
+    channel_config_set_chain_to(&cfg2, dma_chan2);
+    dma_channel_configure(dma_chan2, &cfg2,
+                          dma_raw_buf2, &pio->rxf[sm2],
+                          DMA_BLOCK_WORDS, false);
+    dma_channel_set_irq0_enabled(dma_chan2, true);
+
+    /* 全チャンネルを DMA_IRQ_0 の単一ハンドラで処理 */
+    irq_set_exclusive_handler(DMA_IRQ_0, dma_handler_all);
+    irq_set_enabled(DMA_IRQ_0, true);
+
+    dma_start_channel_mask((1u << dma_chan0) | (1u << dma_chan1) | (1u << dma_chan2));
 }
 
 /* ===== メイン ===== */
@@ -442,12 +505,16 @@ int main(void) {
 
     __atomic_store_n(&cpu_read_count0, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&cpu_read_count1, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&cpu_read_count2, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&dma_write_count0, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&dma_write_count1, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&dma_write_count2, 0u, __ATOMIC_RELEASE);
     drop_seq0 = 0;
     drop_seq1 = 0;
+    drop_seq2 = 0;
     drop_latched0 = false;
     drop_latched1 = false;
+    drop_latched2 = false;
     logger_armed = false;
 
     /* DMA が既に書き込んだ分をスキップしてから開始 */
@@ -456,6 +523,9 @@ int main(void) {
                      __ATOMIC_RELEASE);
     __atomic_store_n(&cpu_read_count1,
                      __atomic_load_n(&dma_write_count1, __ATOMIC_ACQUIRE),
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&cpu_read_count2,
+                     __atomic_load_n(&dma_write_count2, __ATOMIC_ACQUIRE),
                      __ATOMIC_RELEASE);
 
 #if TEXT_MODE == 0
@@ -472,6 +542,7 @@ int main(void) {
     uint32_t last_status_ms = now_ms();
     uint8_t  last_drop_seq0 = drop_seq0;
     uint8_t  last_drop_seq1 = drop_seq1;
+    uint8_t  last_drop_seq2 = drop_seq2;
 
     while (1) {
         uint32_t now = now_ms();
@@ -484,9 +555,11 @@ int main(void) {
             /* drop_seq の直近1秒間の増分で LED モードを決定 */
             uint8_t delta_drop0 = (uint8_t)(drop_seq0 - last_drop_seq0);
             uint8_t delta_drop1 = (uint8_t)(drop_seq1 - last_drop_seq1);
-            uint16_t delta_drop = (uint16_t)delta_drop0 + (uint16_t)delta_drop1;
+            uint8_t delta_drop2 = (uint8_t)(drop_seq2 - last_drop_seq2);
+            uint16_t delta_drop = (uint16_t)delta_drop0 + (uint16_t)delta_drop1 + (uint16_t)delta_drop2;
             last_drop_seq0 = drop_seq0;
             last_drop_seq1 = drop_seq1;
+            last_drop_seq2 = drop_seq2;
 
             if (delta_drop == 0) {
                 led_mode = LED_OFF;
@@ -502,12 +575,17 @@ int main(void) {
                 uint32_t r0 = __atomic_load_n(&cpu_read_count0,  __ATOMIC_ACQUIRE);
                 uint32_t w1 = __atomic_load_n(&dma_write_count1, __ATOMIC_ACQUIRE);
                 uint32_t r1 = __atomic_load_n(&cpu_read_count1,  __ATOMIC_ACQUIRE);
+                uint32_t w2 = __atomic_load_n(&dma_write_count2, __ATOMIC_ACQUIRE);
+                uint32_t r2 = __atomic_load_n(&cpu_read_count2,  __ATOMIC_ACQUIRE);
                 uint32_t pending0 = (w0 >= r0) ? (w0 - r0) : 0;
                 uint32_t pending1 = (w1 >= r1) ? (w1 - r1) : 0;
+                uint32_t pending2 = (w2 >= r2) ? (w2 - r2) : 0;
                 printf("[STATUS SM0] w=%u r=%u pending=%u drop_seq=%u\n",
                        (unsigned)w0, (unsigned)r0, (unsigned)pending0, (unsigned)drop_seq0);
                 printf("[STATUS SM1] w=%u r=%u pending=%u drop_seq=%u\n",
                        (unsigned)w1, (unsigned)r1, (unsigned)pending1, (unsigned)drop_seq1);
+                printf("[STATUS SM2] w=%u r=%u pending=%u drop_seq=%u\n",
+                       (unsigned)w2, (unsigned)r2, (unsigned)pending2, (unsigned)drop_seq2);
             }
 #endif
             last_status_ms = now;
@@ -541,6 +619,20 @@ int main(void) {
 #endif
         }
 
+        /* SM2バッファ読み出し */
+        uint32_t written2 = __atomic_load_n(&dma_write_count2, __ATOMIC_ACQUIRE);
+        while (__atomic_load_n(&cpu_read_count2, __ATOMIC_ACQUIRE) < written2) {
+            uint32_t idx = __atomic_load_n(&cpu_read_count2, __ATOMIC_ACQUIRE) & LOG_BUF_MASK;
+            uint32_t raw = dma_raw_buf2[idx];
+            __atomic_fetch_add(&cpu_read_count2, 1u, __ATOMIC_RELEASE);
+#if TEXT_MODE == 0
+            enqueue_event_packet(SM_ID_RD,
+                                 extract_addr(raw),
+                                 extract_data(raw),
+                                 make_flags(raw));
+#endif
+        }
+
         /* 'c' キーで DROP フラグをリセット（テキストモード時のみ） */
 #if TEXT_MODE == 1
         int ch = getchar_timeout_us(0);
@@ -549,8 +641,11 @@ int main(void) {
             drop_seq0     = 0;
             drop_latched1 = false;
             drop_seq1     = 0;
+            drop_latched2 = false;
+            drop_seq2     = 0;
             last_drop_seq0 = 0;
             last_drop_seq1 = 0;
+            last_drop_seq2 = 0;
             led_mode      = LED_OFF;
             printf("[CMD] drop_latched をクリア\n");
         }

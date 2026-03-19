@@ -1,4 +1,4 @@
-; MSXバスロガー PIO プログラム（SM0: /WRトリガー、SM1: /IORQトリガー）
+; MSXバスロガー PIO プログラム（SM0: /WRトリガー、SM1: /IORQトリガー、SM2: /RDトリガー）
 ;
 ; ISR ビット配置（in pins, 32、in_base=GPIO0）:
 ;   [15:0]  = A0-A15  (GPIO0-15)  : アドレスバス
@@ -36,4 +36,18 @@ loop:
     in   pins, 32           ; GPIO0-31 を一括取り込む
     push block              ; RX FIFO へ
     wait 1 gpio 26          ; /IORQ がHighに戻るまで待つ
+    jmp  loop
+
+; ─────────────────────────────────────────────────────────
+; SM2用: /RD (GPIO24) トリガー
+; IO Read + MEM Read を取得
+; jmp_pin = GPIO24 (/RD)
+; ─────────────────────────────────────────────────────────
+.program msx_bus_logger_rd
+
+loop:
+    wait 0 gpio 24          ; /RD がLow になるまで待つ
+    in   pins, 32           ; GPIO0-31 を一括取り込む
+    push block              ; RX FIFO へ
+    wait 1 gpio 24          ; /RD がHighに戻るまで待つ
     jmp  loop
