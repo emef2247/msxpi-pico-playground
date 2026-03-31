@@ -6,6 +6,25 @@ Use at your own risk.
 
 ---
 
+## Projects
+
+### [msx_bus_logger](msx_bus_logger/README.md) — MSX Bus Logger
+
+Full MSX I/O bus logger (A0-A15, D0-D7, /RD, /WR, /IORQ, /SLTSL) for the MSXpi
+hardware. Streams captured events over USB CDC with a Python analysis script.
+
+### [io_capture](io_capture/README.md) — RP2040 I/O Bus Capture Pipeline
+
+Minimal, drop-resistant I/O bus capture pipeline using PIO + DMA + dual-core:
+
+- Triggers on **/IOQR (active low)** via PIO; one 32-bit packet per access
+- GPIO0-7 = A0-A7, GPIO8-15 = D0-D7, GPIO16 = /WR, GPIO17 = /IOQR
+- DMA streams PIO RX FIFO into an SRAM ring buffer without CPU polling
+- Core1 filters write cycles to OPLL (0x7C/0x7D) and PSG (0xA0/0xA1) ports
+- Overflow/drop detection counters; periodic status output over USB CDC
+
+---
+
 ## 開発環境の立ち上げ
 
 以下は **WSL / Ubuntu 22.04** を想定した手順です。

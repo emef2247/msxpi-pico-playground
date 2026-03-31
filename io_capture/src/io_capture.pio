@@ -1,0 +1,26 @@
+; io_capture.pio — RP2040 I/O bus capture, triggered by /IOQR (active low)
+;
+; GPIO pin mapping (matches #defines in main.c):
+;   GPIO0-7   = A0-A7   → captured word bits [7:0]   (addr8 = word & 0xFF)
+;   GPIO8-15  = D0-D7   → captured word bits [15:8]  (data8 = (word>>8) & 0xFF)
+;   GPIO16    = /WR     → captured word bit  16       (0 = write asserted)
+;   GPIO17    = /IOQR   → captured word bit  17       (0 = asserted / trigger)
+;   GPIO18-31 = unused  → captured word bits [31:18]  (reserved for future use)
+;
+; State machine configuration (set in C):
+;   sm_config_set_in_pins(&c, 0)                    // in_base = GPIO0
+;   sm_config_set_jmp_pin(&c, PIN_IOQR)             // jmp_pin = GPIO17
+;   sm_config_set_in_shift(&c, true, false, 32)     // shift-right, no autopush
+;
+; Behaviour:
+;   One 32-bit word is pushed to the RX FIFO per /IOQR pulse (assert → deassert).
+;   The wait 1 at the end prevents a second sample from the same bus cycle.
+
+.program io_capture
+
+.wrap_target
+    wait 0 gpio 17      ; wait for /IOQR asserted (GPIO17 = 0, active low)
+    in   pins, 32       ; sample GPIO0-31 into ISR (in_base = GPIO0)
+    push block          ; push 32-bit ISR word to RX FIFO (block if full)
+    wait 1 gpio 17      ; wait for /IOQR deasserted (GPIO17 = 1) — 1 access = 1 packet
+.wrap
